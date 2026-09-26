@@ -22,6 +22,7 @@ class EventStatus:
     RECEIVED = "received"
     CLASSIFIED = "classified"
     NOTIFIED = "notified"
+    NOTIFY_FAILED = "notify_failed"
     FAILED = "failed"
 
 

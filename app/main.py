@@ -1,0 +1,194 @@
+"""FastAPI application: webhook intake plus small read-only endpoints for monitoring."""
+
+import json
+import logging
+from collections.abc import Callable
+from typing import Any
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.config import Settings, get_settings
+from app.db import init_db, make_engine, make_session_factory
+from app.models import Event, Failure
+from app.security import verify_tally_signature
+from app.tally import TallyPayloadError, parse_tally_payload
+
+logger = logging.getLogger("supportflow")
+
+# A processor takes the id of a stored event and runs the rest of the pipeline.
+Processor = Callable[[int], None]
+
+
+def _noop_processor(event_id: int) -> None:  # pragma: no cover - placeholder
+    logger.info("event %s stored; no processor configured", event_id)
+
+
+def create_app(
+    settings: Settings | None = None,
+    session_factory: sessionmaker[Session] | None = None,
+    processor: Processor | None = None,
+) -> FastAPI:
+    settings = settings or get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    if session_factory is None:
+        engine = make_engine(settings.database_url)
+        init_db(engine)
+        session_factory = make_session_factory(engine)
+
+    if processor is None:
+        from app.pipeline import build_processor
+
+        processor = build_processor(settings, session_factory)
+
+    app = FastAPI(
+        title="SupportFlow",
+        description="AI support-automation pipeline: Tally webhook -> LLM classification -> Slack.",
+        version="0.1.0",
+    )
+
+    def record_failure(stage: str, error: str, event_id: int | None = None) -> None:
+        with session_factory() as session:
+            session.add(Failure(event_id=event_id, stage=stage, error=error[:2000]))
+            session.commit()
+
+    @app.get("/health")
+    def health() -> JSONResponse:
+        try:
+            with session_factory() as session:
+                session.execute(text("SELECT 1"))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("health check failed: %s", exc)
+            return JSONResponse({"status": "degraded", "database": "error"}, status_code=503)
+        return JSONResponse({"status": "ok", "database": "ok"})
+
+    @app.post("/webhooks/tally", status_code=202)
+    async def tally_webhook(request: Request, background: BackgroundTasks) -> Any:
+        body = await request.body()
+
+        # 1. Authenticity first: nothing is parsed or stored before the signature checks out.
+        signature = request.headers.get("tally-signature")
+        if not verify_tally_signature(body, signature, settings.tally_signing_secret):
+            logger.warning("rejected webhook with invalid signature")
+            raise HTTPException(status_code=401, detail="invalid signature")
+
+        # 2. Shape checks.
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="body is not valid JSON")
+        if not isinstance(payload, dict) or not payload.get("eventId"):
+            raise HTTPException(status_code=400, detail="missing eventId")
+        external_id = str(payload["eventId"])
+
+        try:
+            message = parse_tally_payload(payload)
+        except TallyPayloadError as exc:
+            record_failure("parse", f"{external_id}: {exc}")
+            raise HTTPException(status_code=422, detail=str(exc))
+
+        # 3. Idempotency: Tally retries deliveries, so the same eventId can arrive twice.
+        with session_factory() as session:
+            existing = session.scalar(select(Event).where(Event.external_id == external_id))
+            if existing is not None:
+                logger.info("duplicate webhook %s ignored", external_id)
+                return JSONResponse(
+                    {"status": "duplicate", "event_id": existing.id}, status_code=200
+                )
+
+            event = Event(
+                external_id=external_id,
+                payload=payload,
+                customer_name=message.name,
+                customer_email=message.email,
+                message=message.message,
+            )
+            session.add(event)
+            try:
+                session.commit()
+            except IntegrityError:
+                # Two deliveries raced past the check above; the unique index caught it.
+                session.rollback()
+                existing = session.scalar(select(Event).where(Event.external_id == external_id))
+                return JSONResponse(
+                    {"status": "duplicate", "event_id": existing.id if existing else None},
+                    status_code=200,
+                )
+            event_id = event.id
+
+        # 4. Respond fast; classification and Slack run after the response is sent.
+        background.add_task(processor, event_id)
+        logger.info("accepted webhook %s as event %s", external_id, event_id)
+        return {"status": "accepted", "event_id": event_id}
+
+    @app.get("/events")
+    def list_events(limit: int = Query(20, ge=1, le=200)) -> list[dict[str, Any]]:
+        with session_factory() as session:
+            rows = session.scalars(select(Event).order_by(Event.id.desc()).limit(limit)).all()
+            return [
+                {
+                    "id": e.id,
+                    "external_id": e.external_id,
+                    "status": e.status,
+                    "created_at": e.created_at.isoformat(),
+                    "message": e.message[:200],
+                    "classification": (
+                        {
+                            "category": e.classification.category,
+                            "urgency": e.classification.urgency,
+                            "sentiment": e.classification.sentiment,
+                            "language": e.classification.language,
+                            "order_id": e.classification.order_id,
+                            "summary": e.classification.summary,
+                            "latency_ms": e.classification.latency_ms,
+                        }
+                        if e.classification
+                        else None
+                    ),
+                }
+                for e in rows
+            ]
+
+    @app.get("/failures")
+    def list_failures(limit: int = Query(20, ge=1, le=200)) -> list[dict[str, Any]]:
+        with session_factory() as session:
+            rows = session.scalars(select(Failure).order_by(Failure.id.desc()).limit(limit)).all()
+            return [
+                {
+                    "id": f.id,
+                    "event_id": f.event_id,
+                    "stage": f.stage,
+                    "error": f.error,
+                    "attempts": f.attempts,
+                    "created_at": f.created_at.isoformat(),
+                }
+                for f in rows
+            ]
+
+    return app
+
+
+def get_app() -> FastAPI:
+    """Entry point for uvicorn: `uvicorn app.main:app`."""
+    return create_app()
+
+
+_app: FastAPI | None = None
+
+
+def __getattr__(name: str) -> Any:
+    # `app.main:app` is built lazily, so importing this module in tests
+    # doesn't read the real .env or create the real database.
+    if name == "app":
+        global _app
+        if _app is None:
+            _app = create_app()
+        return _app
+    raise AttributeError(name)

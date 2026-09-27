@@ -51,17 +51,30 @@ Return ONLY a JSON object with these fields:
     refund        the customer wants money back or to return an item
     order_status  the customer asks where an order is or when it will arrive
     complaint     the customer is unhappy with a product, delivery or service
-    spam          advertising, nonsense, or not a real customer request
-    other         a genuine request that fits none of the above
-- urgency: "high" if the customer is angry, mentions a deadline, or money is at risk;
-  "medium" for normal problems; "low" for general questions and spam
+    spam          advertising, prizes, links to click, or anything that is not a real
+                  customer writing about their own order or account
+    other         a genuine customer request that fits none of the above
+- urgency: "high" only if the customer is angry, mentions a deadline, or asks for money
+  back urgently; "medium" for normal problems such as a late order; "low" for general
+  questions. Spam is always "low".
 - sentiment: "positive", "neutral" or "negative"
 - language: "bn" for Bangla, "en" for English, "mixed" for Bangla and English together
   (including Bangla written in English letters)
 - order_id: the order number if one is mentioned, otherwise null
 - summary: one short English sentence describing what the customer needs
 
-Messages may be written in Bangla, English, or both. Always write the summary in English."""
+Messages may be written in Bangla, English, or both. Always write the summary in English.
+
+Examples:
+
+Message: You have been selected for a $500 gift card! Claim it here: bit.ly/xyz
+{"category": "spam", "urgency": "low", "sentiment": "neutral", "language": "en", "order_id": null, "summary": "Promotional spam, not a customer request."}
+
+Message: My order ORD-55 was supposed to come on Monday, it's Thursday now. Any update?
+{"category": "order_status", "urgency": "medium", "sentiment": "neutral", "language": "en", "order_id": "ORD-55", "summary": "Customer asks for an update on a late order."}
+
+Message: Apnader product ta ekdom baje, ami khub hotash. Keu reply o dey na!
+{"category": "complaint", "urgency": "high", "sentiment": "negative", "language": "mixed", "order_id": null, "summary": "Angry customer says the product is poor and nobody replies."}"""
 
 
 def build_user_prompt(message: SupportMessage) -> str:
@@ -122,6 +135,10 @@ def classify(
         # The form's order ID is more reliable than the model's reading of free text.
         if result.order_id is None and message.order_id:
             result.order_id = message.order_id
+        # Business rule, enforced in code rather than trusted to the model:
+        # spam never goes to the top of the queue.
+        if result.category == "spam":
+            result.urgency = "low"
 
         return ClassificationOutcome(
             result=result,

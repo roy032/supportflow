@@ -84,6 +84,23 @@ def test_form_order_id_fills_in_when_model_misses_it():
     assert outcome.result.order_id == "ORD-1042"
 
 
+def test_spam_is_always_low_urgency():
+    spam = {**VALID, "category": "spam", "urgency": "high", "order_id": None}
+    outcome = classify(FakeProvider(spam), SupportMessage(message="You won a free iPhone!!!"))
+    assert outcome.result.urgency == "low"
+
+
+def test_prompt_includes_worked_examples_with_valid_labels():
+    import re
+
+    from app.classifier import SYSTEM_PROMPT, ClassificationResult
+
+    examples = re.findall(r"^\{.*\}$", SYSTEM_PROMPT, flags=re.MULTILINE)
+    assert len(examples) >= 3
+    for example in examples:
+        ClassificationResult.model_validate(json.loads(example))  # examples must obey the schema
+
+
 def test_ollama_provider_sends_schema_and_parses_reply():
     seen = {}
 

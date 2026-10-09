@@ -19,10 +19,25 @@ CATEGORY_LABEL = {
 }
 
 
+# Upper bound on a single wait, so a large Retry-After can't block a worker for minutes.
+MAX_WAIT_SECONDS = 30.0
+
+
 class SlackError(RuntimeError):
     def __init__(self, message: str, attempts: int) -> None:
         super().__init__(message)
         self.attempts = attempts
+
+
+def _retry_after_seconds(value: str | None, default: float) -> float:
+    """Parse a Retry-After header given in seconds; fall back to `default` otherwise."""
+    if value is None:
+        return default
+    try:
+        seconds = float(value)
+    except ValueError:
+        return default  # HTTP-date form or garbage
+    return seconds if seconds >= 0 else default
 
 
 def build_message(
@@ -91,13 +106,19 @@ class SlackNotifier:
         """Post `message`; return the number of attempts it took.
 
         Retries network errors, HTTP 429 (honouring Retry-After) and 5xx with exponential
-        backoff. Other 4xx responses mean the request itself is wrong (for example a revoked
-        webhook URL), so they fail immediately.
+        backoff; each wait is capped at MAX_WAIT_SECONDS. Other 4xx responses and malformed
+        URLs mean the request itself is wrong (for example a revoked webhook URL), so they
+        fail immediately.
         """
         last_error = ""
         for attempt in range(1, self.max_attempts + 1):
             try:
                 response = self._client.post(self.webhook_url, json=message)
+            except (httpx.UnsupportedProtocol, httpx.InvalidURL) as exc:
+                # A malformed URL is a configuration error; retrying cannot fix it.
+                raise SlackError(
+                    f"Slack rejected the message (invalid SLACK_WEBHOOK_URL: {exc})", attempt
+                ) from exc
             except httpx.HTTPError as exc:
                 last_error = f"network error: {exc}"
                 wait = self.backoff_seconds * 2 ** (attempt - 1)
@@ -106,13 +127,16 @@ class SlackNotifier:
                     return attempt
                 last_error = f"HTTP {response.status_code}: {response.text[:200]}"
                 if response.status_code == 429:
-                    wait = float(response.headers.get("Retry-After", self.backoff_seconds))
+                    wait = _retry_after_seconds(
+                        response.headers.get("Retry-After"), self.backoff_seconds
+                    )
                 elif response.status_code >= 500:
                     wait = self.backoff_seconds * 2 ** (attempt - 1)
                 else:
                     raise SlackError(f"Slack rejected the message ({last_error})", attempt)
 
             if attempt < self.max_attempts:
+                wait = min(wait, MAX_WAIT_SECONDS)
                 logger.warning("Slack attempt %s failed (%s); retrying in %.1fs", attempt, last_error, wait)
                 self._sleep(wait)
 

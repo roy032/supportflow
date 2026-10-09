@@ -46,7 +46,8 @@ def parse_tally_payload(payload: dict[str, Any]) -> SupportMessage:
     if payload.get("eventType") != "FORM_RESPONSE":
         raise TallyPayloadError(f"unsupported eventType: {payload.get('eventType')!r}")
 
-    fields = (payload.get("data") or {}).get("fields")
+    data = payload.get("data")
+    fields = data.get("fields") if isinstance(data, dict) else None
     if not isinstance(fields, list):
         raise TallyPayloadError("payload has no data.fields list")
 

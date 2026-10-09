@@ -135,3 +135,41 @@ def test_ollama_unreachable_becomes_llm_error():
     provider = OllamaProvider("http://ollama.test", "m", client=httpx.Client(transport=httpx.MockTransport(handler)))
     with pytest.raises(LLMError, match="Could not reach Ollama"):
         provider.complete_json("s", "u", SCHEMA)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [{"message": None}, {"message": {"content": None}}, {"message": "text"}, ["not", "a", "dict"]],
+)
+def test_ollama_malformed_reply_becomes_llm_error(reply):
+    client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=reply)))
+    provider = OllamaProvider("http://ollama.test", "m", client=client)
+    with pytest.raises(LLMError, match="Unexpected response shape"):
+        provider.complete_json("s", "u", SCHEMA)
+
+
+def test_ollama_malformed_reply_is_recorded_as_classification_failure():
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"message": None}))
+    )
+    provider = OllamaProvider("http://ollama.test", "m", client=client)
+    with pytest.raises(ClassificationError, match="provider error"):
+        classify(provider, MSG)
+
+
+def test_ollama_connect_timeout_is_short_but_read_timeout_is_configurable():
+    provider = OllamaProvider("http://ollama.test", "m", timeout=300)
+    timeout = provider._client.timeout
+    assert timeout.read == 300
+    assert timeout.connect == 10.0
+
+
+def test_long_order_id_from_model_is_truncated_to_column_size():
+    outcome = classify(FakeProvider({**VALID, "order_id": "X" * 500}), MSG)
+    assert outcome.result.order_id == "X" * 64
+
+
+def test_long_form_order_id_is_truncated_too():
+    message = SupportMessage(message="where is it", order_id="Y" * 100)
+    outcome = classify(FakeProvider({**VALID, "order_id": None}), message)
+    assert outcome.result.order_id == "Y" * 64

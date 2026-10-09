@@ -18,3 +18,4 @@ Tally form -> signed webhook -> FastAPI -> stored event -> LLM classification (s
 - Run: `uvicorn app.main:app --reload --port 8000`
 - Test: `pytest -q`
 - Send a signed test webhook: `python scripts/send_test_webhook.py`
+- Replay unfinished events: `python scripts/replay_events.py --dry-run`

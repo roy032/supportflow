@@ -19,12 +19,20 @@ from app.tally import TallyPayloadError, parse_tally_payload
 
 logger = logging.getLogger("supportflow")
 
+# Length of events.external_id.
+EXTERNAL_ID_MAX_LENGTH = 128
+
 # A processor takes the id of a stored event and runs the rest of the pipeline.
 Processor = Callable[[int], None]
 
 
 def _noop_processor(event_id: int) -> None:  # pragma: no cover - placeholder
     logger.info("event %s stored; no processor configured", event_id)
+
+
+def _clip(value: str | None, length: int) -> str | None:
+    """Fit a form value into its column; Postgres rejects over-long strings."""
+    return value[:length] if value is not None else None
 
 
 def create_app(
@@ -34,9 +42,11 @@ def create_app(
 ) -> FastAPI:
     settings = settings or get_settings()
     logging.basicConfig(
-        level=settings.log_level.upper(),
+        level=settings.log_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if not settings.tally_signing_secret:
+        logger.warning("TALLY_SIGNING_SECRET is not set; every webhook will be rejected with 401")
 
     if session_factory is None:
         engine = make_engine(settings.database_url)
@@ -83,14 +93,20 @@ def create_app(
         try:
             payload = json.loads(body)
         except ValueError:
+            logger.warning("rejected webhook: body is not valid JSON")
             raise HTTPException(status_code=400, detail="body is not valid JSON")
         if not isinstance(payload, dict) or not payload.get("eventId"):
+            logger.warning("rejected webhook: missing eventId")
             raise HTTPException(status_code=400, detail="missing eventId")
         external_id = str(payload["eventId"])
+        if len(external_id) > EXTERNAL_ID_MAX_LENGTH:
+            logger.warning("rejected webhook: eventId longer than %s", EXTERNAL_ID_MAX_LENGTH)
+            raise HTTPException(status_code=400, detail="eventId is too long")
 
         try:
             message = parse_tally_payload(payload)
         except TallyPayloadError as exc:
+            logger.warning("rejected webhook %s: %s", external_id, exc)
             record_failure("parse", f"{external_id}: {exc}")
             raise HTTPException(status_code=422, detail=str(exc))
 
@@ -106,8 +122,8 @@ def create_app(
             event = Event(
                 external_id=external_id,
                 payload=payload,
-                customer_name=message.name,
-                customer_email=message.email,
+                customer_name=_clip(message.name, 200),
+                customer_email=_clip(message.email, 320),
                 message=message.message,
             )
             session.add(event)

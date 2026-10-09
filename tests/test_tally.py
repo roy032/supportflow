@@ -32,3 +32,11 @@ def test_rejects_payload_without_message():
     payload["data"]["fields"] = [f for f in payload["data"]["fields"] if f["label"] != "Message"]
     with pytest.raises(TallyPayloadError):
         parse_tally_payload(payload)
+
+
+@pytest.mark.parametrize("data", [None, "text", ["a"], {"fields": "nope"}])
+def test_malformed_data_is_a_payload_error(data):
+    payload = make_tally_payload()
+    payload["data"] = data
+    with pytest.raises(TallyPayloadError):
+        parse_tally_payload(payload)

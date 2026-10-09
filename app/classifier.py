@@ -15,6 +15,8 @@ Urgency = Literal["low", "medium", "high"]
 Sentiment = Literal["positive", "neutral", "negative"]
 Language = Literal["bn", "en", "mixed"]
 
+ORDER_ID_MAX_LENGTH = 64  # matches classifications.order_id
+
 
 class ClassificationResult(BaseModel):
     category: Category
@@ -34,7 +36,9 @@ class ClassificationResult(BaseModel):
     def _empty_to_none(cls, value: object) -> object:
         if isinstance(value, str) and value.strip().lower() in {"", "null", "none", "n/a"}:
             return None
-        return value.strip() if isinstance(value, str) else value
+        # Truncate rather than reject: the column holds 64 characters, and a long
+        # order ID is not worth failing the whole classification over.
+        return value.strip()[:ORDER_ID_MAX_LENGTH] if isinstance(value, str) else value
 
     @field_validator("summary", mode="before")
     @classmethod
@@ -134,7 +138,7 @@ def classify(
 
         # The form's order ID is more reliable than the model's reading of free text.
         if result.order_id is None and message.order_id:
-            result.order_id = message.order_id
+            result.order_id = message.order_id[:ORDER_ID_MAX_LENGTH]
         # Business rule, enforced in code rather than trusted to the model:
         # spam never goes to the top of the queue.
         if result.category == "spam":

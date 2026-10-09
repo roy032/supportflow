@@ -106,3 +106,36 @@ def test_gives_up_after_max_attempts():
     with pytest.raises(SlackError, match="after 3 attempts"):
         notifier.send(sample_message())
     assert len(sent) == 3 and sleeps == [1.0, 2.0]
+
+
+def test_retry_after_in_http_date_form_falls_back_to_backoff():
+    sleeps = []
+    notifier, _ = notifier_with(
+        [
+            httpx.Response(429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+            httpx.Response(200, text="ok"),
+        ],
+        sleeps,
+    )
+    assert notifier.send(sample_message()) == 2
+    assert sleeps == [1.0]
+
+
+def test_long_retry_after_is_capped():
+    from app.slack import MAX_WAIT_SECONDS
+
+    sleeps = []
+    notifier, _ = notifier_with(
+        [httpx.Response(429, headers={"Retry-After": "3600"}), httpx.Response(200, text="ok")],
+        sleeps,
+    )
+    notifier.send(sample_message())
+    assert sleeps == [MAX_WAIT_SECONDS]
+
+
+def test_malformed_webhook_url_fails_immediately():
+    sleeps = []
+    notifier = SlackNotifier("hooks.slack.test/no-scheme", sleep=sleeps.append)
+    with pytest.raises(SlackError, match="invalid SLACK_WEBHOOK_URL") as info:
+        notifier.send(sample_message())
+    assert info.value.attempts == 1 and sleeps == []

@@ -23,5 +23,8 @@ def verify_tally_signature(body: bytes, signature: str | None, secret: str) -> b
     """
     if not secret or not signature:
         return False
-    expected = compute_tally_signature(body, secret)
-    return hmac.compare_digest(expected, signature.strip())
+    expected = compute_tally_signature(body, secret).encode("ascii")
+    # Compare bytes, not str: compare_digest raises TypeError on non-ASCII str input,
+    # which would turn a forged header into a 500 instead of a 401.
+    received = signature.strip().encode("utf-8", errors="replace")
+    return hmac.compare_digest(expected, received)

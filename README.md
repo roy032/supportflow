@@ -33,13 +33,14 @@ Python, FastAPI, SQLAlchemy 2.0 (SQLite locally, Postgres-ready), Pydantic, http
 
 ## Design decisions
 
-- **Verify before parsing.** The signature is checked on the raw request bytes before the body is parsed or stored, and the comparison is constant-time. If no secret is configured, every request is rejected, so a misconfigured server fails closed.
+- **Verify before parsing.** The signature is checked on the raw request bytes before the body is parsed or stored, and the comparison is constant-time. If no secret is configured (or the `.env.example` placeholder is left in place), every request is rejected and a warning is logged at startup, so a misconfigured server fails closed.
 - **Idempotent intake.** Webhook senders retry, so the same event can arrive more than once. Tally's `eventId` has a unique index; a repeat delivery returns `200 duplicate` and is not processed again, even if two deliveries race.
 - **Respond fast, work later.** The endpoint only verifies and stores. Classification and Slack run after the response is sent, so a slow model never causes Tally to time out and retry.
 - **Structured, validated LLM output.** The model is constrained to a JSON schema, and the result is validated again with Pydantic. Invalid output gets one retry that tells the model what was wrong; if it still fails, the failure is recorded instead of crashing the worker.
 - **Provider interface.** The pipeline talks to an `LLMProvider` interface. Ollama keeps the project free and offline; a cloud model is a new class and one setting, with no pipeline changes.
-- **Safe to re-run.** An event that is already classified is never sent to the LLM again; if only the Slack step failed, re-running resends the notification without paying for a second classification.
-- **Retry only what can succeed.** Slack calls retry network errors, `429` (honouring `Retry-After`) and `5xx` with exponential backoff. Other `4xx` errors, such as a revoked webhook URL, fail immediately.
+- **Safe to re-run.** An event that is already classified is never sent to the LLM again; if only the Slack step failed, `scripts/replay_events.py` resends the notification without paying for a second classification.
+- **Retry only what can succeed.** Slack calls retry network errors, `429` (honouring `Retry-After`, capped at 30 seconds) and `5xx` with exponential backoff. Other `4xx` errors and a malformed webhook URL fail immediately.
+- **Bounded waits.** Slack calls time out after 10 seconds. Ollama gets `LLM_TIMEOUT_SECONDS` to generate, but only 10 seconds to connect, so an unreachable host fails fast.
 - **Forms can change.** Tally fields are matched by label keywords, so the form can be edited without code changes.
 
 ## Getting started
@@ -75,6 +76,19 @@ python scripts/send_test_webhook.py                             # send English, 
 
 Then open http://localhost:8000/events to see how each one was classified.
 
+### Replay failed events
+
+Events that did not reach Slack (Ollama or Slack was down, the server restarted mid-task) can be run through the pipeline again:
+
+```bash
+python scripts/replay_events.py --dry-run               # list unfinished events
+python scripts/replay_events.py                         # replay all of them
+python scripts/replay_events.py --status notify_failed  # only Slack failures
+python scripts/replay_events.py --event-id 12           # one event
+```
+
+Only events last updated at least 5 minutes ago are picked, so work the server is still doing is left alone. Notified events are never touched.
+
 ### Connect a real Tally form
 
 1. Run `ngrok http 8000` and copy the `https://...` forwarding URL.
@@ -99,7 +113,7 @@ Event status moves through `received`, `classified`, `notified`, or ends in `fai
 pytest -q
 ```
 
-The suite covers signature verification, idempotency, payload parsing (including Bangla text), classifier retries and validation, Slack retry behaviour, and the full webhook-to-Slack flow. External services are mocked, so tests need no network, model or Slack workspace. GitHub Actions runs them on Python 3.11 to 3.13 on every push.
+The suite covers signature verification, idempotency, payload parsing (including Bangla text), settings validation, classifier retries and validation, Slack retry behaviour, replay of unfinished events, and the full webhook-to-Slack flow. External services are mocked, so tests need no network, model or Slack workspace. GitHub Actions runs them on Python 3.11 to 3.13 on every push.
 
 ## Project layout
 
@@ -111,9 +125,10 @@ app/
   classifier.py   Prompt, JSON schema, validation and retry logic
   llm/            LLMProvider interface and the Ollama provider
   pipeline.py     Classify -> store -> notify, with failure recording
+  replay.py       Find unfinished events and run them through the pipeline again
   slack.py        Slack message formatting and retrying sender
   models.py       events, classifications, failures tables
-scripts/          Test webhook sender, Slack test, classifier playground
+scripts/          Test webhook sender, Slack test, classifier playground, event replay
 tests/            pytest suite
 RUNBOOK.md        What to check when something breaks
 DEVELOPMENT.md    Conventions and commands for working on the code
@@ -121,13 +136,13 @@ DEVELOPMENT.md    Conventions and commands for working on the code
 
 ## Known limitations
 
-- Background tasks run in the web process. If the server restarts mid-task, that event stays `received` until it is reprocessed; a job queue is on the roadmap.
+- Background tasks run in the web process. If the server restarts mid-task, that event stays `received` until it is replayed with `scripts/replay_events.py`. Retries after the in-request attempts are manual; there is no automatic retry queue yet.
 - A small local model is fast and free but less accurate than larger models, especially on mixed-language messages.
 - Only Tally is supported as a source so far.
 
 ## Roadmap
 
-- Job queue with a dead-letter queue and a replay command for failed events
+- Job queue with automatic retries and a dead-letter queue (manual replay already exists)
 - RAG auto-replies for common questions, answered from the shop's policy documents
 - Slack approve/edit buttons before a reply is sent
 - Postgres and Docker Compose setup

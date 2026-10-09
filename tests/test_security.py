@@ -22,3 +22,13 @@ def test_missing_signature_or_secret_fails_closed():
     sig = compute_tally_signature(BODY, "secret")
     assert not verify_tally_signature(BODY, None, "secret")
     assert not verify_tally_signature(BODY, sig, "")
+
+
+def test_non_ascii_signature_is_rejected_not_raised():
+    # Header values can carry non-ASCII bytes; this must be a clean rejection.
+    assert not verify_tally_signature(BODY, "sigéÿ", "secret")
+
+
+def test_surrounding_whitespace_in_header_is_ignored():
+    sig = compute_tally_signature(BODY, "secret")
+    assert verify_tally_signature(BODY, f"  {sig} ", "secret")

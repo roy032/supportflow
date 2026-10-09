@@ -96,3 +96,42 @@ def test_events_endpoint_lists_recent_events(client):
     r = client.get("/events?limit=10")
     assert r.status_code == 200
     assert [e["external_id"] for e in r.json()] == ["evt-b", "evt-a"]
+
+
+def test_overlong_event_id_is_rejected(client, processed):
+    r = post(client, make_tally_payload(event_id="x" * 129))
+    assert r.status_code == 400
+    assert processed == []
+
+
+def test_non_ascii_signature_header_is_rejected_with_401(client):
+    body = encode(make_tally_payload())
+    headers = {"Content-Type": "application/json", "Tally-Signature": "sigé".encode("latin-1")}
+    r = client.post("/webhooks/tally", content=body, headers=headers)
+    assert r.status_code == 401
+
+
+def test_malformed_data_is_rejected_with_422(client):
+    payload = make_tally_payload()
+    payload["data"] = "not an object"
+    assert post(client, payload).status_code == 422
+
+
+def test_long_customer_fields_are_clipped_to_column_size(client, session_factory):
+    payload = make_tally_payload(event_id="evt-long")
+    payload["data"]["fields"][0]["value"] = "N" * 500
+    r = post(client, payload)
+    assert r.status_code == 202
+    with session_factory() as s:
+        assert len(s.get(Event, r.json()["event_id"]).customer_name) == 200
+
+
+def test_placeholder_secret_rejects_everything(session_factory, processed):
+    from app.config import Settings
+
+    settings = Settings(_env_file=None, database_url="sqlite://", tally_signing_secret="change-me")
+    client = TestClient(create_app(settings, session_factory, processor=processed.append))
+    body = encode(make_tally_payload())
+    r = client.post("/webhooks/tally", content=body, headers=sign(body, secret="change-me"))
+    assert r.status_code == 401
+    assert processed == []

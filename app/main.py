@@ -1,12 +1,14 @@
 """FastAPI application: webhook intake plus small read-only endpoints for monitoring."""
 
+import hmac
 import json
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -30,6 +32,27 @@ def _noop_processor(event_id: int) -> None:  # pragma: no cover - placeholder
     logger.info("event %s stored; no processor configured", event_id)
 
 
+async def _read_body(request: Request, limit: int) -> bytes:
+    """Read the request body, refusing anything over `limit` bytes without buffering it all."""
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            too_big = int(declared) > limit
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid Content-Length") from None
+        if too_big:
+            raise HTTPException(status_code=413, detail="body is too large")
+    # Content-Length can be absent (chunked) or wrong, so count what actually arrives.
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            raise HTTPException(status_code=413, detail="body is too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _clip(value: str | None, length: int) -> str | None:
     """Fit a form value into its column; Postgres rejects over-long strings."""
     return value[:length] if value is not None else None
@@ -47,6 +70,8 @@ def create_app(
     )
     if not settings.tally_signing_secret:
         logger.warning("TALLY_SIGNING_SECRET is not set; every webhook will be rejected with 401")
+    if not settings.admin_api_key:
+        logger.warning("ADMIN_API_KEY is not set; /events and /failures will reject every request")
 
     if session_factory is None:
         engine = make_engine(settings.database_url)
@@ -63,6 +88,24 @@ def create_app(
         description="AI support-automation pipeline: Tally webhook -> LLM classification -> Slack.",
         version="0.1.0",
     )
+
+    bearer = HTTPBearer(auto_error=False, description="The ADMIN_API_KEY from .env")
+
+    def require_admin(
+        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
+    ) -> None:
+        """Guard endpoints that return customer data. Fails closed when no key is configured."""
+        key = settings.admin_api_key
+        if not (
+            key
+            and credentials is not None
+            and hmac.compare_digest(credentials.credentials.encode(), key.encode())
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="invalid or missing API key",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
 
     def record_failure(stage: str, error: str, event_id: int | None = None) -> None:
         with session_factory() as session:
@@ -81,7 +124,7 @@ def create_app(
 
     @app.post("/webhooks/tally", status_code=202)
     async def tally_webhook(request: Request, background: BackgroundTasks) -> Any:
-        body = await request.body()
+        body = await _read_body(request, settings.max_webhook_body_bytes)
 
         # 1. Authenticity first: nothing is parsed or stored before the signature checks out.
         signature = request.headers.get("tally-signature")
@@ -94,7 +137,7 @@ def create_app(
             payload = json.loads(body)
         except ValueError:
             logger.warning("rejected webhook: body is not valid JSON")
-            raise HTTPException(status_code=400, detail="body is not valid JSON")
+            raise HTTPException(status_code=400, detail="body is not valid JSON") from None
         if not isinstance(payload, dict) or not payload.get("eventId"):
             logger.warning("rejected webhook: missing eventId")
             raise HTTPException(status_code=400, detail="missing eventId")
@@ -108,7 +151,7 @@ def create_app(
         except TallyPayloadError as exc:
             logger.warning("rejected webhook %s: %s", external_id, exc)
             record_failure("parse", f"{external_id}: {exc}")
-            raise HTTPException(status_code=422, detail=str(exc))
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         # 3. Idempotency: Tally retries deliveries, so the same eventId can arrive twice.
         with session_factory() as session:
@@ -144,7 +187,7 @@ def create_app(
         logger.info("accepted webhook %s as event %s", external_id, event_id)
         return {"status": "accepted", "event_id": event_id}
 
-    @app.get("/events")
+    @app.get("/events", dependencies=[Depends(require_admin)])
     def list_events(limit: int = Query(20, ge=1, le=200)) -> list[dict[str, Any]]:
         with session_factory() as session:
             rows = session.scalars(select(Event).order_by(Event.id.desc()).limit(limit)).all()
@@ -172,7 +215,7 @@ def create_app(
                 for e in rows
             ]
 
-    @app.get("/failures")
+    @app.get("/failures", dependencies=[Depends(require_admin)])
     def list_failures(limit: int = Query(20, ge=1, le=200)) -> list[dict[str, Any]]:
         with session_factory() as session:
             rows = session.scalars(select(Failure).order_by(Failure.id.desc()).limit(limit)).all()

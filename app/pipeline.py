@@ -65,7 +65,8 @@ def _classify(session: Session, event: Event, provider: LLMProvider) -> bool:
 
 def _notify(session: Session, event: Event, notifier: SlackNotifier) -> None:
     c = event.classification
-    assert c is not None
+    if c is None:
+        raise RuntimeError(f"event {event.id} has no classification to notify about")
     slack_message = build_message(
         event_id=event.id,
         category=c.category,

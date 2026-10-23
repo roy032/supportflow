@@ -27,3 +27,13 @@ def test_log_level_is_normalised_and_validated():
 def test_timeout_must_be_positive():
     with pytest.raises(ValidationError):
         make(llm_timeout_seconds=0)
+
+
+def test_admin_key_placeholder_counts_as_unset():
+    assert make(admin_api_key="change-me").admin_api_key == ""
+
+
+def test_short_admin_key_is_refused():
+    with pytest.raises(ValidationError):
+        make(admin_api_key="short")
+    assert make(admin_api_key=" " + "k" * 16 + " ").admin_api_key == "k" * 16

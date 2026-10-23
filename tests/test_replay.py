@@ -1,6 +1,6 @@
 """Replay tests: unfinished events are found and finished; finished ones are left alone."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -14,7 +14,7 @@ from tests.conftest import make_tally_payload  # noqa: E402
 from tests.test_classifier import VALID, FakeProvider  # noqa: E402
 from tests.test_pipeline import FakeNotifier  # noqa: E402
 
-NOW = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
 
 
 def add_event(session_factory, status: str, minutes_ago: float) -> int:

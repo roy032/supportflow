@@ -5,7 +5,7 @@ classifications  the LLM's structured output for an event
 failures         anything that went wrong, with the pipeline stage it happened in
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text
@@ -15,7 +15,7 @@ from app.db import Base
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class EventStatus:

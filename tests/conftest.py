@@ -10,6 +10,8 @@ from app.config import Settings
 from app.security import compute_tally_signature
 
 SECRET = "test-signing-secret"
+ADMIN_KEY = "test-admin-key-0123456789"
+ADMIN_HEADERS = {"Authorization": f"Bearer {ADMIN_KEY}"}
 
 
 def make_tally_payload(
@@ -50,6 +52,7 @@ def settings() -> Settings:
     return Settings(
         database_url="sqlite://",
         tally_signing_secret=SECRET,
+        admin_api_key=ADMIN_KEY,
         slack_webhook_url="https://hooks.slack.test/services/T000/B000/XXXX",
         ollama_url="http://ollama.test",
         ollama_model="test-model",

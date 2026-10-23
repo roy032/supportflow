@@ -34,6 +34,8 @@ Python, FastAPI, SQLAlchemy 2.0 (SQLite locally, Postgres-ready), Pydantic, http
 ## Design decisions
 
 - **Verify before parsing.** The signature is checked on the raw request bytes before the body is parsed or stored, and the comparison is constant-time. If no secret is configured (or the `.env.example` placeholder is left in place), every request is rejected and a warning is logged at startup, so a misconfigured server fails closed.
+- **Customer data is behind a key.** `/events` and `/failures` return names, emails and messages, so they require `Authorization: Bearer <ADMIN_API_KEY>`, compared in constant time. Like the webhook, they fail closed when no key is set. The webhook also refuses bodies over `MAX_WEBHOOK_BODY_BYTES` before reading them into memory.
+- **Customer text can't format Slack.** The message, name and summary are escaped before they go into Slack mrkdwn, so a form submission can't ping `@channel` or disguise a phishing link.
 - **Idempotent intake.** Webhook senders retry, so the same event can arrive more than once. Tally's `eventId` has a unique index; a repeat delivery returns `200 duplicate` and is not processed again, even if two deliveries race.
 - **Respond fast, work later.** The endpoint only verifies and stores. Classification and Slack run after the response is sent, so a slow model never causes Tally to time out and retry.
 - **Structured, validated LLM output.** The model is constrained to a JSON schema, and the result is validated again with Pydantic. Invalid output gets one retry that tells the model what was wrong; if it still fails, the failure is recorded instead of crashing the worker.
@@ -56,7 +58,7 @@ python -m venv .venv
 pip install -r requirements-dev.txt
 
 cp .env.example .env              # Windows: copy .env.example .env
-# then edit .env: TALLY_SIGNING_SECRET, SLACK_WEBHOOK_URL
+# then edit .env: TALLY_SIGNING_SECRET, ADMIN_API_KEY, SLACK_WEBHOOK_URL
 
 ollama pull qwen2.5:3b
 uvicorn app.main:app --reload --port 8000
@@ -74,7 +76,13 @@ python scripts/test_slack.py                                    # check the Slac
 python scripts/send_test_webhook.py                             # send English, Bangla and spam samples
 ```
 
-Then open http://localhost:8000/events to see how each one was classified.
+Then look at how each one was classified:
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_API_KEY" http://localhost:8000/events
+```
+
+Or open http://localhost:8000/docs, click **Authorize**, paste the key, and call `/events` from there.
 
 ### Replay failed events
 
@@ -100,9 +108,9 @@ Only events last updated at least 5 minutes ago are picked, so work the server i
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/webhooks/tally` | Receive a signed Tally webhook (`202` accepted, `200` duplicate, `401` bad signature, `400`/`422` bad payload) |
-| `GET` | `/events?limit=20` | Recent events with status and classification |
-| `GET` | `/failures?limit=20` | Recent failures with pipeline stage and error |
+| `POST` | `/webhooks/tally` | Receive a signed Tally webhook (`202` accepted, `200` duplicate, `401` bad signature, `400`/`422` bad payload, `413` too large) |
+| `GET` | `/events?limit=20` | Recent events with status and classification (admin key) |
+| `GET` | `/failures?limit=20` | Recent failures with pipeline stage and error (admin key) |
 | `GET` | `/health` | Liveness and database check |
 
 Event status moves through `received`, `classified`, `notified`, or ends in `failed` (classification) or `notify_failed` (Slack).
@@ -111,9 +119,10 @@ Event status moves through `received`, `classified`, `notified`, or ends in `fai
 
 ```bash
 pytest -q
+ruff check .
 ```
 
-The suite covers signature verification, idempotency, payload parsing (including Bangla text), settings validation, classifier retries and validation, Slack retry behaviour, replay of unfinished events, and the full webhook-to-Slack flow. External services are mocked, so tests need no network, model or Slack workspace. GitHub Actions runs them on Python 3.11 to 3.13 on every push.
+The suite covers signature verification, idempotency, payload parsing (including Bangla text), settings validation, classifier retries and validation, Slack retry behaviour, replay of unfinished events, and the full webhook-to-Slack flow. External services are mocked, so tests need no network, model or Slack workspace. GitHub Actions runs ruff and the tests on Python 3.11 to 3.13 on every push.
 
 ## Project layout
 

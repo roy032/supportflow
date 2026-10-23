@@ -6,7 +6,7 @@ pytest.importorskip("sqlalchemy")
 
 from app.models import Classification, Event, Failure  # noqa: E402
 from app.pipeline import process_event  # noqa: E402
-from tests.conftest import make_tally_payload  # noqa: E402
+from tests.conftest import ADMIN_HEADERS, make_tally_payload  # noqa: E402
 from tests.test_classifier import VALID, FakeProvider  # noqa: E402
 
 
@@ -113,6 +113,6 @@ def test_full_flow_from_webhook_to_slack(settings, session_factory):
     assert r.status_code == 202
     assert len(notifier.sent) == 1
 
-    events = TestClient(app).get("/events").json()
+    events = TestClient(app).get("/events", headers=ADMIN_HEADERS).json()
     assert events[0]["status"] == "notified"
     assert events[0]["classification"]["category"] == "order_status"

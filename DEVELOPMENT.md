@@ -17,5 +17,6 @@ Tally form -> signed webhook -> FastAPI -> stored event -> LLM classification (s
 - Install: `pip install -r requirements-dev.txt`
 - Run: `uvicorn app.main:app --reload --port 8000`
 - Test: `pytest -q`
+- Lint: `ruff check .` (CI fails on lint errors)
 - Send a signed test webhook: `python scripts/send_test_webhook.py`
 - Replay unfinished events: `python scripts/replay_events.py --dry-run`

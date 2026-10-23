@@ -1,6 +1,6 @@
 # SupportFlow runbook
 
-What to check when something goes wrong. Start with the two monitoring endpoints:
+What to check when something goes wrong. Start with the two monitoring endpoints. Both need the admin key: `curl -H "Authorization: Bearer $ADMIN_API_KEY" http://localhost:8000/failures`, or use **Authorize** in http://localhost:8000/docs.
 
 - `GET /failures` shows each failure with its **stage** (`parse`, `classify` or `notify`) and the error.
 - `GET /events` shows each event's **status**: `received`, `classified`, `notified`, `failed` or `notify_failed`.
@@ -34,6 +34,14 @@ The log says `rejected webhook with invalid signature`.
 2. `TALLY_SIGNING_SECRET` in `.env` must exactly match the signing secret in Tally's webhook settings (no quotes; surrounding spaces are ignored).
 3. Restart the server after editing `.env`; settings are read at startup.
 4. To test the server on its own, run `python scripts/send_test_webhook.py`. It signs requests with your `.env` secret, so a `202` there means the server is fine and the mismatch is in Tally.
+
+## `/events` or `/failures` return 401
+
+The startup log says `ADMIN_API_KEY is not set` when the key is empty or still `change-me`. Otherwise the `Authorization` header is missing, isn't `Bearer <key>`, or the key doesn't match `.env`. Restart the server after editing `.env`.
+
+## Webhooks are rejected with 413
+
+The body was larger than `MAX_WEBHOOK_BODY_BYTES` (256 KB by default). Real Tally submissions are a few kilobytes, so this usually means something other than Tally is calling the URL.
 
 ## Webhooks are rejected with 400 or 422
 

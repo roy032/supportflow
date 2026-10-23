@@ -29,6 +29,21 @@ class SlackError(RuntimeError):
         self.attempts = attempts
 
 
+def escape_mrkdwn(text: str) -> str:
+    """Escape the three characters Slack treats as control characters in mrkdwn.
+
+    Customer text (and the LLM's summary of it) must not be able to write `<!channel>`,
+    `<@U123>` or `<https://evil.example|your order>` into the support channel.
+    See https://api.slack.com/reference/surfaces/formatting#escaping
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _quote(text: str) -> str:
+    """Render `text` as a mrkdwn block quote; `>` only quotes the line it starts."""
+    return "\n".join(f">{line}" for line in escape_mrkdwn(text).splitlines() or [""])
+
+
 def _retry_after_seconds(value: str | None, default: float) -> float:
     """Parse a Retry-After header given in seconds; fall back to `default` otherwise."""
     if value is None:
@@ -56,29 +71,31 @@ def build_message(
     category_label = CATEGORY_LABEL.get(category, category)
     urgency_label = URGENCY_LABEL.get(urgency, urgency)
     preview = message if len(message) <= 500 else message[:497] + "..."
-    customer = customer_name or "Unknown customer"
+    customer = escape_mrkdwn(customer_name or "Unknown customer")
     if customer_email:
-        customer += f" ({customer_email})"
+        customer += f" ({escape_mrkdwn(customer_email)})"
+    summary_text = escape_mrkdwn(summary)
+    order_text = escape_mrkdwn(order_id) if order_id else "none"
 
     return {
         # Plain-text fallback for notifications and clients that can't render blocks.
-        "text": f"[{urgency_label}] {category_label}: {summary}",
+        "text": f"[{urgency_label}] {category_label}: {summary_text}",
         "blocks": [
             {
                 "type": "header",
                 "text": {"type": "plain_text", "text": f"{category_label} | urgency: {urgency_label}"},
             },
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"*{summary}*"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"*{summary_text}*"}},
             {
                 "type": "section",
                 "fields": [
                     {"type": "mrkdwn", "text": f"*Customer*\n{customer}"},
-                    {"type": "mrkdwn", "text": f"*Order ID*\n{order_id or 'none'}"},
+                    {"type": "mrkdwn", "text": f"*Order ID*\n{order_text}"},
                     {"type": "mrkdwn", "text": f"*Sentiment*\n{sentiment}"},
                     {"type": "mrkdwn", "text": f"*Language*\n{language}"},
                 ],
             },
-            {"type": "section", "text": {"type": "mrkdwn", "text": f">{preview}"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": _quote(preview)}},
             {
                 "type": "context",
                 "elements": [{"type": "mrkdwn", "text": f"SupportFlow event #{event_id}"}],

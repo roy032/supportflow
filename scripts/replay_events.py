@@ -1,11 +1,14 @@
 """Re-run unfinished events through the pipeline (classification and Slack).
 
-Use it after Ollama or Slack was down, after fixing SLACK_WEBHOOK_URL, or when events
-are stuck in `received` because the server restarted mid-task. Events that are already
-classified are not sent to the LLM again, and notified events are never touched.
+Failed events are retried automatically (see app/jobs.py). Use this for events the
+worker gave up on (`dead`), after fixing a configuration problem, or for events from
+before the job queue existed. Each replayed event gets a fresh retry budget. Events that
+are already classified are not sent to the LLM again, and notified events are never
+touched.
 
 Usage:
     python scripts/replay_events.py                          # all unfinished events
+    python scripts/replay_events.py --status dead            # events the worker gave up on
     python scripts/replay_events.py --status notify_failed   # only Slack failures
     python scripts/replay_events.py --event-id 12 --event-id 15
     python scripts/replay_events.py --dry-run                # list, don't process
@@ -23,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.config import get_settings  # noqa: E402
 from app.db import init_db, make_engine, make_session_factory  # noqa: E402
+from app.jobs import JobRunner, RetryPolicy  # noqa: E402
 from app.models import EventStatus  # noqa: E402
 from app.pipeline import build_processor  # noqa: E402
 from app.replay import UNFINISHED_STATUSES, find_unfinished, replay  # noqa: E402
@@ -73,7 +77,14 @@ def main() -> int:
     if not settings.slack_webhook_url:
         print("Note: SLACK_WEBHOOK_URL is not set, so events will stop at `classified`.")
 
-    results = replay(event_ids, build_processor(settings, session_factory), session_factory)
+    runner = JobRunner(
+        session_factory, build_processor(settings, session_factory),
+        RetryPolicy.from_settings(settings),
+    )
+    runner.requeue(event_ids)
+    # A worker could claim a requeued event first; runner.run then skips it, and the
+    # status printed below is whatever that worker has reached.
+    results = replay(event_ids, runner.run, session_factory)
     still_failing = 0
     for event_id, (before, after) in results.items():
         if before is None:
@@ -81,7 +92,7 @@ def main() -> int:
             continue
         print(f"event {event_id}: {before} -> {after}")
         still_failing += after in (
-            EventStatus.RECEIVED, EventStatus.FAILED, EventStatus.NOTIFY_FAILED
+            EventStatus.RECEIVED, EventStatus.FAILED, EventStatus.NOTIFY_FAILED, EventStatus.DEAD
         )
 
     print("\nDetails of any new failures: GET /failures")

@@ -3,7 +3,7 @@
 import logging
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The value shipped in .env.example. Treated as "not set" so a copied example file
@@ -33,6 +33,18 @@ class Settings(BaseSettings):
 
     slack_webhook_url: str = ""
 
+    # Job queue (see app/jobs.py). An event is run at most JOB_MAX_ATTEMPTS times
+    # automatically, waiting JOB_RETRY_BASE_SECONDS * 2^n (capped) between runs.
+    job_max_attempts: int = Field(default=5, ge=1)
+    job_retry_base_seconds: float = Field(default=30.0, gt=0)
+    job_retry_max_seconds: float = Field(default=3600.0, gt=0)
+    # How long a worker may hold an event before another worker may take it over.
+    job_lease_seconds: float = Field(default=600.0, gt=0)
+    worker_poll_seconds: float = Field(default=2.0, gt=0)
+    # Run the worker as a thread inside the web server. Convenient locally; in production
+    # run `python -m app.worker` separately and set this to false.
+    run_worker_in_process: bool = True
+
     log_level: str = "INFO"
 
     @field_validator("tally_signing_secret", "admin_api_key", "slack_webhook_url", mode="before")
@@ -54,6 +66,18 @@ class Settings(BaseSettings):
                 "generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
             )
         return value
+
+    @model_validator(mode="after")
+    def _lease_outlasts_a_run(self) -> "Settings":
+        # A run is two LLM calls plus Slack retries. If the lease ran out first, a second
+        # worker could take the event over and post it to Slack twice.
+        minimum = 2 * self.llm_timeout_seconds + 120
+        if self.job_lease_seconds < minimum:
+            raise ValueError(
+                f"JOB_LEASE_SECONDS must be at least {minimum:.0f} "
+                "(2 x LLM_TIMEOUT_SECONDS + 120) so a slow run isn't picked up twice"
+            )
+        return self
 
     @field_validator("log_level")
     @classmethod

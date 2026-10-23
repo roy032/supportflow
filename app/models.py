@@ -1,6 +1,7 @@
 """Database tables.
 
-events           one row per accepted webhook (raw payload kept for replay/debugging)
+events           one row per accepted webhook (raw payload kept for replay/debugging); also
+                 the job queue: next_attempt_at says when a worker should (re)process it
 classifications  the LLM's structured output for an event
 failures         anything that went wrong, with the pipeline stage it happened in
 """
@@ -24,6 +25,8 @@ class EventStatus:
     NOTIFIED = "notified"
     NOTIFY_FAILED = "notify_failed"
     FAILED = "failed"
+    # Gave up after JOB_MAX_ATTEMPTS automatic runs; only a manual replay retries it.
+    DEAD = "dead"
 
 
 class Event(Base):
@@ -38,6 +41,14 @@ class Event(Base):
     customer_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     customer_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     message: Mapped[str] = mapped_column(Text)
+
+    # Job queue. A worker may run the event when next_attempt_at has passed and no other
+    # worker holds an unexpired lease (locked_until). NULL next_attempt_at: nothing to do.
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now

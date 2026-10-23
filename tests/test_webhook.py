@@ -202,3 +202,14 @@ def test_invalid_content_length_is_rejected(client):
     headers = {**sign(body), "Content-Length": "abc"}
     r = client.post("/webhooks/tally", content=body, headers=headers)
     assert r.status_code == 400
+
+
+def test_accepted_event_stays_queued_if_the_first_run_does_not_finish(client, session_factory):
+    # The test processor does nothing, as if the server stopped mid-task: the event must
+    # remain scheduled so a worker retries it.
+    r = post(client, make_tally_payload(event_id="evt-q"))
+    with session_factory() as s:
+        event = s.get(Event, r.json()["event_id"])
+        assert event.attempts == 1
+        assert event.next_attempt_at is not None
+        assert event.locked_until is None

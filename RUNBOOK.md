@@ -3,15 +3,15 @@
 What to check when something goes wrong. Start with the two monitoring endpoints. Both need the admin key: `curl -H "Authorization: Bearer $ADMIN_API_KEY" http://localhost:8000/failures`, or use **Authorize** in http://localhost:8000/docs.
 
 - `GET /failures` shows each failure with its **stage** (`parse`, `classify` or `notify`) and the error.
-- `GET /events` shows each event's **status**: `received`, `classified`, `notified`, `failed` or `notify_failed`.
+- `GET /events` shows each event's **status** (`received`, `classified`, `notified`, `failed`, `notify_failed` or `dead`), how many times it has run (`attempts`) and when it will be retried next (`next_attempt_at`, empty when nothing is scheduled).
 
 The server log (the terminal running `uvicorn`) has a line for every accepted, rejected, classified and notified event.
 
-Most failures can be retried once the cause is fixed, without re-sending anything from Tally:
+Failed events are retried automatically with exponential backoff (30 seconds, then 1, 2, 4 minutes and so on, up to an hour), so a short Ollama or Slack outage fixes itself. After `JOB_MAX_ATTEMPTS` runs (5 by default) the event is marked `dead`. Once the cause is fixed, queue dead events again without re-sending anything from Tally:
 
 ```bash
-python scripts/replay_events.py --dry-run   # what would be replayed
-python scripts/replay_events.py             # replay every unfinished event
+python scripts/replay_events.py --dry-run          # what would be replayed
+python scripts/replay_events.py --status dead      # queue and run them now
 ```
 
 Classified events are not sent to the LLM again, and notified events are never touched. Events updated in the last 5 minutes are skipped, so the script is safe to run while the server is up.
@@ -50,7 +50,13 @@ The body was larger than `MAX_WEBHOOK_BODY_BYTES` (256 KB by default). Real Tall
 
 ## Events are stuck in `received`
 
-Classification never finished. Usually the server restarted while the event was being processed, or the process crashed. Check the log for `unexpected error while processing event`, then run `python scripts/replay_events.py --status received`.
+If `next_attempt_at` is set, the event is queued: is a worker running? The startup log should say `worker started`. With `RUN_WORKER_IN_PROCESS=false`, start one with `python -m app.worker`. If a worker died while holding the event, another takes it over once the lease (`JOB_LEASE_SECONDS`, 10 minutes by default) runs out.
+
+If `next_attempt_at` is empty, the event predates the job queue. Run `python scripts/replay_events.py --status received`.
+
+## Events end in `dead`
+
+The worker gave up after `JOB_MAX_ATTEMPTS` runs. `/failures` has one row per failed run, and the `stage` tells you which section below applies. Fix the cause, then run `python scripts/replay_events.py --status dead`.
 
 ## Events end in `failed` (stage `classify`)
 
@@ -64,7 +70,7 @@ The LLM step failed twice. The error in `/failures` says why:
 | `not valid JSON` / `field '...'` | The model answered in the wrong format twice | Try the message with `python scripts/try_classifier.py "..."`; consider a larger model |
 | `Unexpected response shape` | Ollama answered, but not in the chat API format | Check `OLLAMA_URL` points at Ollama itself, not a proxy or another service |
 
-After fixing the cause, run `python scripts/replay_events.py --status failed`.
+These are retried automatically. If the event ended up `dead`, run `python scripts/replay_events.py --status dead` after fixing the cause.
 
 ## Events end in `notify_failed` (stage `notify`)
 
@@ -77,7 +83,7 @@ Classification worked, Slack didn't.
 | `HTTP 403` / `invalid_token` | The Slack app was removed from the channel | Reinstall the app to the workspace |
 | `after 3 attempts` + `429` / `5xx` / `network error` | Slack or the network was down | Usually temporary; check https://status.slack.com |
 
-Run `python scripts/test_slack.py` to test the Slack connection on its own. Once it works (restart the server if you changed `.env`), resend the missed notifications with `python scripts/replay_events.py --status notify_failed`.
+Run `python scripts/test_slack.py` to test the Slack connection on its own. Once it works (restart the server if you changed `.env`), the next automatic retry sends it. For events that already ended `dead`, run `python scripts/replay_events.py --status dead`.
 
 ## Resetting local data
 

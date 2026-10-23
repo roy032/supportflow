@@ -20,3 +20,6 @@ Tally form -> signed webhook -> FastAPI -> stored event -> LLM classification (s
 - Lint: `ruff check .` (CI fails on lint errors)
 - Send a signed test webhook: `python scripts/send_test_webhook.py`
 - Replay unfinished events: `python scripts/replay_events.py --dry-run`
+- Run a standalone worker: `python -m app.worker`
+- Schema change: edit `app/models.py`, then `alembic revision --autogenerate -m "..."`, review the file,
+  and commit it. Migrations run on startup; `tests/test_migrations.py` fails if models and migrations drift.

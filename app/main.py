@@ -3,7 +3,9 @@
 import hmac
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
@@ -15,6 +17,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings, get_settings
 from app.db import init_db, make_engine, make_session_factory
+from app.jobs import JobRunner, RetryPolicy, Worker
 from app.models import Event, Failure
 from app.security import verify_tally_signature
 from app.tally import TallyPayloadError, parse_tally_payload
@@ -83,10 +86,23 @@ def create_app(
 
         processor = build_processor(settings, session_factory)
 
+    runner = JobRunner(session_factory, processor, RetryPolicy.from_settings(settings))
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        worker = None
+        if settings.run_worker_in_process:
+            worker = Worker(runner, poll_seconds=settings.worker_poll_seconds)
+            worker.start_thread()
+        yield
+        if worker is not None:
+            worker.stop()
+
     app = FastAPI(
         title="SupportFlow",
         description="AI support-automation pipeline: Tally webhook -> LLM classification -> Slack.",
         version="0.1.0",
+        lifespan=lifespan,
     )
 
     bearer = HTTPBearer(auto_error=False, description="The ADMIN_API_KEY from .env")
@@ -168,6 +184,7 @@ def create_app(
                 customer_name=_clip(message.name, 200),
                 customer_email=_clip(message.email, 320),
                 message=message.message,
+                next_attempt_at=datetime.now(UTC),
             )
             session.add(event)
             try:
@@ -183,7 +200,9 @@ def create_app(
             event_id = event.id
 
         # 4. Respond fast; classification and Slack run after the response is sent.
-        background.add_task(processor, event_id)
+        # The event is already queued, so if this first try fails (or the server stops
+        # before it runs) a worker retries it with backoff.
+        background.add_task(runner.run, event_id)
         logger.info("accepted webhook %s as event %s", external_id, event_id)
         return {"status": "accepted", "event_id": event_id}
 
@@ -196,6 +215,10 @@ def create_app(
                     "id": e.id,
                     "external_id": e.external_id,
                     "status": e.status,
+                    "attempts": e.attempts,
+                    "next_attempt_at": (
+                        e.next_attempt_at.isoformat() if e.next_attempt_at else None
+                    ),
                     "created_at": e.created_at.isoformat(),
                     "message": e.message[:200],
                     "classification": (

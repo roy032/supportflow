@@ -88,7 +88,10 @@ def main() -> int:
             return 1
         print(f"{name:8} -> HTTP {response.status_code} {response.text}")
 
-    print("\nCheck progress at http://localhost:8000/events and /failures")
+    print(
+        "\nCheck progress with the admin key:\n"
+        '  curl -H "Authorization: Bearer $ADMIN_API_KEY" http://localhost:8000/events'
+    )
     return 0
 
 

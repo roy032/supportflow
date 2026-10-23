@@ -13,23 +13,25 @@ flowchart LR
     C -->|no| X[401, nothing stored]
     C -->|yes| D{Seen this eventId?}
     D -->|yes| Y[200 duplicate, ignored]
-    D -->|no| E[(events)]
-    E -->|background task| F[LLM classification<br/>JSON schema + Pydantic]
+    D -->|no| E[(events<br/>= job queue)]
+    E -->|worker takes a lease| F[LLM classification<br/>JSON schema + Pydantic]
     F -->|invalid output| G[retry once with feedback]
     G -->|still invalid| H[(failures)]
     F -->|valid| I[(classifications)]
     I --> J[Slack incoming webhook<br/>retries with backoff]
     J -->|gave up| H
+    H -.->|retry with backoff,<br/>dead after N runs| E
 ```
 
 1. **Intake.** The webhook endpoint verifies Tally's HMAC-SHA256 signature over the raw body, rejects anything unsigned, and stores the event. It responds immediately with `202 Accepted`.
-2. **Classification.** A background task sends the message to the LLM, which must return JSON matching a schema: category, urgency, sentiment, language, order ID and a one-line summary. The output is validated with Pydantic.
+2. **Classification.** A worker picks up the queued event and sends the message to the LLM, which must return JSON matching a schema: category, urgency, sentiment, language, order ID and a one-line summary. The output is validated with Pydantic.
 3. **Notification.** The result is posted to a Slack channel.
-4. **Monitoring.** `/events` shows recent events and their status; `/failures` shows what went wrong and where.
+4. **Retries.** If either step fails, the event is retried automatically with exponential backoff. After `JOB_MAX_ATTEMPTS` runs it is marked `dead` for a person to look at.
+5. **Monitoring.** `/events` shows recent events and their status; `/failures` shows what went wrong and where.
 
 ## Tech stack
 
-Python, FastAPI, SQLAlchemy 2.0 (SQLite locally, Postgres-ready), Pydantic, httpx, Ollama (local LLM, `qwen2.5:3b` by default), Slack incoming webhooks, pytest, GitHub Actions.
+Python, FastAPI, SQLAlchemy 2.0 with Alembic migrations (SQLite locally, Postgres-ready), Pydantic, httpx, Ollama (local LLM, `qwen2.5:3b` by default), Slack incoming webhooks, pytest, GitHub Actions.
 
 ## Design decisions
 
@@ -38,9 +40,11 @@ Python, FastAPI, SQLAlchemy 2.0 (SQLite locally, Postgres-ready), Pydantic, http
 - **Customer text can't format Slack.** The message, name and summary are escaped before they go into Slack mrkdwn, so a form submission can't ping `@channel` or disguise a phishing link.
 - **Idempotent intake.** Webhook senders retry, so the same event can arrive more than once. Tally's `eventId` has a unique index; a repeat delivery returns `200 duplicate` and is not processed again, even if two deliveries race.
 - **Respond fast, work later.** The endpoint only verifies and stores. Classification and Slack run after the response is sent, so a slow model never causes Tally to time out and retry.
+- **No event is lost.** The `events` table doubles as a job queue. A worker claims an event with one conditional `UPDATE` that takes a lease, so two workers never run the same event, and a worker that dies mid-run just lets its lease expire for another to take over. Failed runs are retried with capped, jittered exponential backoff and end in `dead` after `JOB_MAX_ATTEMPTS`. This needs no Redis or broker and behaves the same on SQLite and Postgres. The lease is validated to outlast a worst-case run, so a slow model can't cause a double Slack post.
+- **Schema changes are migrations.** Alembic migrations run on startup, and a database created before migrations existed is detected and upgraded in place.
 - **Structured, validated LLM output.** The model is constrained to a JSON schema, and the result is validated again with Pydantic. Invalid output gets one retry that tells the model what was wrong; if it still fails, the failure is recorded instead of crashing the worker.
 - **Provider interface.** The pipeline talks to an `LLMProvider` interface. Ollama keeps the project free and offline; a cloud model is a new class and one setting, with no pipeline changes.
-- **Safe to re-run.** An event that is already classified is never sent to the LLM again; if only the Slack step failed, `scripts/replay_events.py` resends the notification without paying for a second classification.
+- **Safe to re-run.** An event that is already classified is never sent to the LLM again; if only the Slack step failed, a retry resends the notification without paying for a second classification.
 - **Retry only what can succeed.** Slack calls retry network errors, `429` (honouring `Retry-After`, capped at 30 seconds) and `5xx` with exponential backoff. Other `4xx` errors and a malformed webhook URL fail immediately.
 - **Bounded waits.** Slack calls time out after 10 seconds. Ollama gets `LLM_TIMEOUT_SECONDS` to generate, but only 10 seconds to connect, so an unreachable host fails fast.
 - **Forms can change.** Tally fields are matched by label keywords, so the form can be edited without code changes.
@@ -84,18 +88,36 @@ curl -H "Authorization: Bearer $ADMIN_API_KEY" http://localhost:8000/events
 
 Or open http://localhost:8000/docs, click **Authorize**, paste the key, and call `/events` from there.
 
-### Replay failed events
+### Run the worker separately (production)
 
-Events that did not reach Slack (Ollama or Slack was down, the server restarted mid-task) can be run through the pipeline again:
+By default a worker thread runs inside the web server, which is all you need locally. In production, set `RUN_WORKER_IN_PROCESS=false` for the web server and run one or more workers next to it:
+
+```bash
+python -m app.worker
+```
+
+Several workers (and several web servers) are safe at once; each event is leased to one worker at a time.
+
+### Replay dead events
+
+Failures are retried automatically. Events the worker gave up on (`dead`), and events from before the job queue existed, can be queued again with a fresh retry budget once the cause is fixed:
 
 ```bash
 python scripts/replay_events.py --dry-run               # list unfinished events
-python scripts/replay_events.py                         # replay all of them
+python scripts/replay_events.py --status dead           # events the worker gave up on
 python scripts/replay_events.py --status notify_failed  # only Slack failures
 python scripts/replay_events.py --event-id 12           # one event
 ```
 
 Only events last updated at least 5 minutes ago are picked, so work the server is still doing is left alone. Notified events are never touched.
+
+### Database migrations
+
+Migrations run automatically when the server or worker starts. After changing `app/models.py`, generate a migration and review it before committing:
+
+```bash
+alembic revision --autogenerate -m "describe the change"
+```
 
 ### Connect a real Tally form
 
@@ -113,7 +135,7 @@ Only events last updated at least 5 minutes ago are picked, so work the server i
 | `GET` | `/failures?limit=20` | Recent failures with pipeline stage and error (admin key) |
 | `GET` | `/health` | Liveness and database check |
 
-Event status moves through `received`, `classified`, `notified`, or ends in `failed` (classification) or `notify_failed` (Slack).
+Event status moves through `received`, `classified`, `notified`. `failed` (classification) and `notify_failed` (Slack) are retried automatically; after `JOB_MAX_ATTEMPTS` runs the event becomes `dead`. Each event in `/events` also shows `attempts` and `next_attempt_at`.
 
 ## Tests
 
@@ -134,6 +156,9 @@ app/
   classifier.py   Prompt, JSON schema, validation and retry logic
   llm/            LLMProvider interface and the Ollama provider
   pipeline.py     Classify -> store -> notify, with failure recording
+  jobs.py         Job queue on the events table: leases, retries with backoff, dead-lettering
+  worker.py       Standalone worker process: python -m app.worker
+  migrations/     Alembic migrations, applied on startup
   replay.py       Find unfinished events and run them through the pipeline again
   slack.py        Slack message formatting and retrying sender
   models.py       events, classifications, failures tables
@@ -145,13 +170,11 @@ DEVELOPMENT.md    Conventions and commands for working on the code
 
 ## Known limitations
 
-- Background tasks run in the web process. If the server restarts mid-task, that event stays `received` until it is replayed with `scripts/replay_events.py`. Retries after the in-request attempts are manual; there is no automatic retry queue yet.
 - A small local model is fast and free but less accurate than larger models, especially on mixed-language messages.
 - Only Tally is supported as a source so far.
 
 ## Roadmap
 
-- Job queue with automatic retries and a dead-letter queue (manual replay already exists)
 - RAG auto-replies for common questions, answered from the shop's policy documents
 - Slack approve/edit buttons before a reply is sent
 - Postgres and Docker Compose setup

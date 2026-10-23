@@ -19,6 +19,7 @@ UNFINISHED_STATUSES: tuple[str, ...] = (
     EventStatus.CLASSIFIED,
     EventStatus.FAILED,
     EventStatus.NOTIFY_FAILED,
+    EventStatus.DEAD,
 )
 
 # Events touched more recently than this may still be in progress in the web server.

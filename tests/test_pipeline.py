@@ -6,7 +6,7 @@ pytest.importorskip("sqlalchemy")
 
 from app.models import Classification, Event, Failure  # noqa: E402
 from app.pipeline import process_event  # noqa: E402
-from tests.conftest import make_tally_payload  # noqa: E402
+from tests.conftest import ADMIN_HEADERS, make_tally_payload  # noqa: E402
 from tests.test_classifier import VALID, FakeProvider  # noqa: E402
 
 
@@ -113,6 +113,19 @@ def test_full_flow_from_webhook_to_slack(settings, session_factory):
     assert r.status_code == 202
     assert len(notifier.sent) == 1
 
-    events = TestClient(app).get("/events").json()
+    events = TestClient(app).get("/events", headers=ADMIN_HEADERS).json()
     assert events[0]["status"] == "notified"
     assert events[0]["classification"]["category"] == "order_status"
+
+
+def test_token_usage_is_stored_with_the_classification(session_factory):
+    import json
+
+    from app.llm.base import LLMResult
+
+    event_id = store_event(session_factory)
+    provider = FakeProvider(LLMResult(json.dumps(VALID), input_tokens=321, output_tokens=45))
+    process_event(event_id, session_factory, provider)
+    with session_factory() as s:
+        c = s.get(Event, event_id).classification
+        assert (c.input_tokens, c.output_tokens) == (321, 45)

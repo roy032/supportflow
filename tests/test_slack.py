@@ -58,6 +58,28 @@ def test_long_messages_are_truncated():
     assert len(preview) <= 502 and preview.endswith("...")
 
 
+def test_customer_text_cannot_inject_mentions_or_links():
+    msg = build_message(
+        event_id=1, category="other", urgency="low", sentiment="neutral", language="en",
+        summary="Says <!channel> & asks", order_id="<@U123>",
+        customer_name="<!here>", customer_email="a@b.c",
+        message="hi <!channel>\nclick <https://evil.example|your order>",
+    )
+    blob = json.dumps(msg)
+    assert "<!" not in blob and "<@" not in blob and "<https" not in blob
+    assert "&lt;!channel&gt; &amp; asks" in msg["text"]
+
+
+def test_every_line_of_a_multiline_message_is_quoted():
+    msg = build_message(
+        event_id=1, category="other", urgency="low", sentiment="neutral", language="en",
+        summary="s", order_id=None, customer_name=None, customer_email=None,
+        message="line one\n*not quoted?*\nline three",
+    )
+    preview = msg["blocks"][3]["text"]["text"]
+    assert preview.split("\n") == [">line one", ">*not quoted?*", ">line three"]
+
+
 def test_success_on_first_try():
     sleeps = []
     notifier, sent = notifier_with([httpx.Response(200, text="ok")], sleeps)

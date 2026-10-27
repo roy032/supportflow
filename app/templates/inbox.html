@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Inbox{% endblock %}
+{% block content %}
+<style>
+.tabs { display: flex; gap: 4px; margin-bottom: 16px; flex-wrap: wrap; }
+.tabs a { padding: 6px 12px; border-radius: 8px; color: var(--text); }
+.tabs a.on { background: var(--panel); border: 1px solid var(--line); font-weight: 600; }
+.filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; align-items: center; }
+.filters input[type=search] { flex: 1; min-width: 180px; }
+.row { display: grid; grid-template-columns: 90px 1fr auto; gap: 12px; padding: 12px 16px;
+       border-top: 1px solid var(--line); color: var(--text); }
+.row:first-child { border-top: 0; }
+.row:hover { background: var(--bg); text-decoration: none; }
+.row .summary { font-weight: 550; }
+.row .meta { font-size: 13px; }
+.empty { padding: 32px; text-align: center; }
+@media (max-width: 700px) { .row { grid-template-columns: 1fr; gap: 4px; } }
+</style>
+<nav class="tabs">
+  {% for s in ["open", "pending", "resolved"] %}
+  <a href="?status={{ s }}" class="{{ 'on' if status == s }}">{{ s|capitalize }} <span class="muted">{{ counts[s] }}</span></a>
+  {% endfor %}
+  <a href="?status=all" class="{{ 'on' if status == 'all' }}">All</a>
+</nav>
+<form class="filters" method="get">
+  <input type="hidden" name="status" value="{{ status }}">
+  <input type="search" name="q" value="{{ q }}" placeholder="Search message, customer or order ID">
+  <select name="urgency"><option value="">Any urgency</option>
+    {% for u in ["high", "medium", "low"] %}<option value="{{ u }}" {{ 'selected' if urgency == u }}>{{ u|capitalize }}</option>{% endfor %}
+  </select>
+  <select name="category"><option value="">Any category</option>
+    {% for c in categories %}<option value="{{ c }}" {{ 'selected' if category == c }}>{{ c.replace('_', ' ')|capitalize }}</option>{% endfor %}
+  </select>
+  <label><input type="checkbox" name="mine" value="true" {{ 'checked' if mine }}> Mine</label>
+  <button>Filter</button>
+</form>
+<div class="panel">
+  {% for t in tickets %}
+  {% set c = t.classification %}
+  <a class="row" href="/dashboard/tickets/{{ t.id }}">
+    <div>{% if c %}<span class="badge u-{{ c.urgency }}">{{ c.urgency|capitalize }}</span>{% else %}<span class="badge">New</span>{% endif %}</div>
+    <div>
+      <div class="summary">{{ c.summary if c else t.message[:120] }}</div>
+      <div class="meta muted">
+        {{ t.customer_name or "Unknown customer" }}
+        {% if c %} · {{ c.category.replace('_', ' ') }}{% if c.order_id %} · {{ c.order_id }}{% endif %}{% endif %}
+        {% if t.draft() %} · reply drafted{% endif %}
+        {% if t.assignee %} · {{ t.assignee }}{% endif %}
+      </div>
+    </div>
+    <div class="meta muted" title="{{ t.created_at }}">{{ t.created_at|ago }}</div>
+  </a>
+  {% else %}
+  <p class="empty muted">Nothing here.</p>
+  {% endfor %}
+</div>
+{% if pages > 1 %}
+<p class="muted">Page {{ page }} of {{ pages }}
+  {% if page > 1 %}<a href="?{{ request.query_params|qs(page=page-1) }}">Previous</a>{% endif %}
+  {% if page < pages %}<a href="?{{ request.query_params|qs(page=page+1) }}">Next</a>{% endif %}
+</p>
+{% endif %}
+{% endblock %}

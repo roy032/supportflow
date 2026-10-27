@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import create_app  # noqa: E402
 from app.models import Event, Failure  # noqa: E402
-from tests.conftest import encode, make_tally_payload, sign  # noqa: E402
+from tests.conftest import ADMIN_HEADERS, encode, make_tally_payload, sign  # noqa: E402
 
 
 @pytest.fixture
@@ -93,7 +93,7 @@ def test_payload_without_message_is_rejected_and_logged(client, session_factory)
 def test_events_endpoint_lists_recent_events(client):
     post(client, make_tally_payload(event_id="evt-a"))
     post(client, make_tally_payload(event_id="evt-b"))
-    r = client.get("/events?limit=10")
+    r = client.get("/events?limit=10", headers=ADMIN_HEADERS)
     assert r.status_code == 200
     assert [e["external_id"] for e in r.json()] == ["evt-b", "evt-a"]
 
@@ -135,3 +135,81 @@ def test_placeholder_secret_rejects_everything(session_factory, processed):
     r = client.post("/webhooks/tally", content=body, headers=sign(body, secret="change-me"))
     assert r.status_code == 401
     assert processed == []
+
+
+@pytest.mark.parametrize("path", ["/events", "/failures"])
+@pytest.mark.parametrize(
+    "headers",
+    [{}, {"Authorization": "Bearer wrong-key-wrong-key"}, {"Authorization": "Basic abc"}],
+    ids=["missing", "wrong", "not-bearer"],
+)
+def test_monitoring_endpoints_require_the_admin_key(client, path, headers):
+    r = client.get(path, headers=headers)
+    assert r.status_code == 401
+    assert r.headers["www-authenticate"] == "Bearer"
+
+
+def test_failures_endpoint_works_with_the_admin_key(client):
+    payload = make_tally_payload()
+    payload["data"]["fields"] = []
+    post(client, payload)
+    r = client.get("/failures", headers=ADMIN_HEADERS)
+    assert r.status_code == 200
+    assert r.json()[0]["stage"] == "parse"
+
+
+def test_monitoring_endpoints_fail_closed_without_a_configured_key(session_factory, processed):
+    from app.config import Settings
+
+    settings = Settings(_env_file=None, database_url="sqlite://", tally_signing_secret="x")
+    client = TestClient(create_app(settings, session_factory, processor=processed.append))
+    assert client.get("/events", headers={"Authorization": "Bearer "}).status_code == 401
+    assert client.get("/events").status_code == 401
+
+
+def test_health_needs_no_key(client):
+    assert client.get("/health").status_code == 200
+
+
+def test_oversized_body_is_rejected_before_anything_is_stored(settings, session_factory, processed):
+    small = settings.model_copy(update={"max_webhook_body_bytes": 1024})
+    client = TestClient(create_app(small, session_factory, processor=processed.append))
+    payload = make_tally_payload(message="x" * 2000)
+    r = post(client, payload)
+    assert r.status_code == 413
+    assert processed == []
+    with session_factory() as s:
+        assert s.query(Event).count() == 0
+
+
+def test_oversized_chunked_body_is_rejected(settings, session_factory, processed):
+    small = settings.model_copy(update={"max_webhook_body_bytes": 1024})
+    client = TestClient(create_app(small, session_factory, processor=processed.append))
+    body = encode(make_tally_payload(message="x" * 2000))
+
+    def chunks():
+        yield body[:600]
+        yield body[600:]
+
+    # A generator body is sent without Content-Length, so the streamed size check applies.
+    r = client.post("/webhooks/tally", content=chunks(), headers=sign(body))
+    assert r.status_code == 413
+    assert processed == []
+
+
+def test_invalid_content_length_is_rejected(client):
+    body = encode(make_tally_payload())
+    headers = {**sign(body), "Content-Length": "abc"}
+    r = client.post("/webhooks/tally", content=body, headers=headers)
+    assert r.status_code == 400
+
+
+def test_accepted_event_stays_queued_if_the_first_run_does_not_finish(client, session_factory):
+    # The test processor does nothing, as if the server stopped mid-task: the event must
+    # remain scheduled so a worker retries it.
+    r = post(client, make_tally_payload(event_id="evt-q"))
+    with session_factory() as s:
+        event = s.get(Event, r.json()["event_id"])
+        assert event.attempts == 1
+        assert event.next_attempt_at is not None
+        assert event.locked_until is None

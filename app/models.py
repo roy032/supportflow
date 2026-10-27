@@ -1,11 +1,14 @@
 """Database tables.
 
-events           one row per accepted webhook (raw payload kept for replay/debugging)
+events           one row per accepted webhook (raw payload kept for replay/debugging); also
+                 the job queue: next_attempt_at says when a worker should (re)process it
+                 and the support ticket: ticket_status, assignee and response timestamps
 classifications  the LLM's structured output for an event
+replies          AI drafts and replies sent to the customer
 failures         anything that went wrong, with the pipeline stage it happened in
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text
@@ -15,7 +18,7 @@ from app.db import Base
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class EventStatus:
@@ -24,6 +27,25 @@ class EventStatus:
     NOTIFIED = "notified"
     NOTIFY_FAILED = "notify_failed"
     FAILED = "failed"
+    # Gave up after JOB_MAX_ATTEMPTS automatic runs; only a manual replay retries it.
+    DEAD = "dead"
+
+
+class TicketStatus:
+    """Where the conversation with the customer stands (independent of the pipeline)."""
+
+    OPEN = "open"  # needs an answer from the shop
+    PENDING = "pending"  # answered; waiting on the customer
+    RESOLVED = "resolved"
+
+    ALL = (OPEN, PENDING, RESOLVED)
+
+
+class ReplyStatus:
+    DRAFT = "draft"  # written by the AI, not sent
+    SENT = "sent"
+    FAILED = "failed"  # sending failed; can be retried
+    DISCARDED = "discarded"  # a draft superseded by a reply the agent wrote
 
 
 class Event(Base):
@@ -38,6 +60,26 @@ class Event(Base):
     customer_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     customer_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     message: Mapped[str] = mapped_column(Text)
+
+    # Job queue. A worker may run the event when next_attempt_at has passed and no other
+    # worker holds an unexpired lease (locked_until). NULL next_attempt_at: nothing to do.
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Support ticket.
+    ticket_status: Mapped[str] = mapped_column(
+        String(16), default=TicketStatus.OPEN, server_default=TicketStatus.OPEN, index=True
+    )
+    assignee: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    first_response_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # When the SLA escalation was posted, so it is posted once.
+    escalated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
@@ -49,6 +91,12 @@ class Event(Base):
     failures: Mapped[list["Failure"]] = relationship(
         back_populates="event", cascade="all, delete-orphan"
     )
+    replies: Mapped[list["Reply"]] = relationship(
+        back_populates="event", cascade="all, delete-orphan", order_by="Reply.id"
+    )
+
+    def draft(self) -> "Reply | None":
+        return next((r for r in reversed(self.replies) if r.status == ReplyStatus.DRAFT), None)
 
 
 class Classification(Base):
@@ -64,10 +112,33 @@ class Classification(Base):
     summary: Mapped[str] = mapped_column(Text)
     model: Mapped[str] = mapped_column(String(64))
     latency_ms: Mapped[int] = mapped_column(Integer)
+    # Tokens used across all attempts, when the provider reports them.
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     event: Mapped[Event] = relationship(back_populates="classification")
+
+
+class Reply(Base):
+    __tablename__ = "replies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), index=True)
+    status: Mapped[str] = mapped_column(String(16), default=ReplyStatus.DRAFT)
+    body: Mapped[str] = mapped_column(Text)
+    # "ai" for drafts, otherwise who sent it (dashboard user or Slack user).
+    author: Mapped[str] = mapped_column(String(100))
+    # For AI drafts: the model, and whether it thinks a person should look first.
+    model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    needs_human: Mapped[bool] = mapped_column(default=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    event: Mapped[Event] = relationship(back_populates="replies")
 
 
 class Failure(Base):

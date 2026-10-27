@@ -5,7 +5,7 @@ sent to the LLM again, and a notified event is skipped. See scripts/replay_event
 """
 
 from collections.abc import Callable, Iterable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -19,6 +19,7 @@ UNFINISHED_STATUSES: tuple[str, ...] = (
     EventStatus.CLASSIFIED,
     EventStatus.FAILED,
     EventStatus.NOTIFY_FAILED,
+    EventStatus.DEAD,
 )
 
 # Events touched more recently than this may still be in progress in the web server.
@@ -34,7 +35,7 @@ def find_unfinished(
 ) -> list[int]:
     """Return ids of events in `statuses` that were last updated at least `min_age` ago."""
     statuses = [s for s in statuses if s != EventStatus.NOTIFIED]
-    cutoff = (now or datetime.now(timezone.utc)) - min_age
+    cutoff = (now or datetime.now(UTC)) - min_age
     stmt = (
         select(Event.id)
         .where(Event.status.in_(statuses), Event.updated_at <= cutoff)

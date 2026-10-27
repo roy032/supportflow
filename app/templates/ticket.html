@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}Ticket #{{ t.id }}{% endblock %}
+{% block content %}
+{% set c = t.classification %}
+<style>
+.grid { display: grid; grid-template-columns: 1fr 300px; gap: 16px; align-items: start; }
+.section { padding: 16px 20px; border-top: 1px solid var(--line); }
+.section:first-child { border-top: 0; }
+.message { white-space: pre-wrap; }
+dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; margin: 0; }
+dt { color: var(--muted); }
+dd { margin: 0; }
+.reply { padding: 10px 0; border-top: 1px dashed var(--line); }
+.reply:first-child { border-top: 0; }
+.side form { display: flex; gap: 8px; margin-top: 8px; }
+.side form select, .side form input { flex: 1; min-width: 0; }
+@media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+</style>
+<p><a href="/dashboard/tickets">&larr; Inbox</a></p>
+{% if sent %}<p class="flash ok">Reply sent to {{ t.customer_email }}.</p>{% endif %}
+{% if error %}<p class="flash err">{{ error }}</p>{% endif %}
+<div class="grid">
+  <div class="panel">
+    <div class="section">
+      <h1 style="margin: 0 0 4px; font-size: 19px;">{{ c.summary if c else "Not classified yet" }}</h1>
+      <div class="muted">#{{ t.id }} · {{ t.customer_name or "Unknown customer" }}{% if t.customer_email %} &lt;{{ t.customer_email }}&gt;{% endif %} · {{ t.created_at|ago }}</div>
+    </div>
+    <div class="section message">{{ t.message }}</div>
+    {% set history = t.replies|selectattr("status", "in", ["sent", "failed"])|list %}
+    {% if history %}
+    <div class="section">
+      <h2 style="margin-top: 0; font-size: 15px;">Replies</h2>
+      {% for r in history %}
+      <div class="reply">
+        <div class="muted">{{ r.author }} · {{ (r.sent_at or r.created_at)|ago }}{% if r.status == "failed" %} · <strong>not sent</strong>: {{ r.error }}{% endif %}</div>
+        <div class="message">{{ r.body }}</div>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+    <div class="section">
+      <h2 style="margin-top: 0; font-size: 15px;">Reply</h2>
+      {% if draft %}
+        <p class="flash {{ 'warn' if draft.needs_human else 'ok' }}" style="margin-bottom: 8px;">
+          {% if draft.needs_human %}Suggested by AI. <strong>Check it before sending</strong>{% if draft.note %}: {{ draft.note }}{% endif %}.
+          {% else %}Suggested by AI from your policies{% if draft.note %} ({{ draft.note }}){% endif %}. Edit it if needed.{% endif %}
+        </p>
+      {% endif %}
+      {% if not can_email %}
+        <p class="flash warn">{% if not t.customer_email %}This customer left no email address.{% else %}Email is not configured (set <code>SMTP_HOST</code> and <code>SMTP_FROM</code>).{% endif %}</p>
+      {% endif %}
+      <form method="post" action="/dashboard/tickets/{{ t.id }}/reply">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <textarea name="body" required maxlength="10000" {{ 'disabled' if not can_email }}>{{ draft.body if draft else "" }}</textarea>
+        <div style="display: flex; gap: 12px; align-items: center; margin-top: 8px;">
+          <button class="primary" {{ 'disabled' if not can_email }}>Send to customer</button>
+          <label><input type="checkbox" name="resolve" value="true"> and resolve</label>
+        </div>
+      </form>
+    </div>
+  </div>
+  <aside class="panel side">
+    <div class="section">
+      <dl>
+        <dt>Status</dt><dd><strong>{{ t.ticket_status|capitalize }}</strong></dd>
+        {% if c %}
+        <dt>Urgency</dt><dd><span class="badge u-{{ c.urgency }}">{{ c.urgency|capitalize }}</span></dd>
+        <dt>Category</dt><dd>{{ c.category.replace('_', ' ')|capitalize }}</dd>
+        <dt>Sentiment</dt><dd>{{ c.sentiment }}</dd>
+        <dt>Language</dt><dd>{{ {"bn": "Bangla", "en": "English", "mixed": "Mixed"}.get(c.language, c.language) }}</dd>
+        <dt>Order</dt><dd>{{ c.order_id or "none" }}</dd>
+        {% endif %}
+        <dt>Assignee</dt><dd>{{ t.assignee or "nobody" }}</dd>
+      </dl>
+    </div>
+    <div class="section">
+      <form method="post" action="/dashboard/tickets/{{ t.id }}/status">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <select name="status">
+          {% for s in ["open", "pending", "resolved"] %}<option value="{{ s }}" {{ 'selected' if t.ticket_status == s }}>{{ s|capitalize }}</option>{% endfor %}
+        </select>
+        <button>Set</button>
+      </form>
+      <form method="post" action="/dashboard/tickets/{{ t.id }}/assign">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="text" name="assignee" value="{{ t.assignee or '' }}" placeholder="Name" maxlength="100">
+        <button>Assign</button>
+      </form>
+      {% if t.assignee != agent %}
+      <form method="post" action="/dashboard/tickets/{{ t.id }}/assign">
+        <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="assignee" value="@me">
+        <button class="link">Assign to me</button>
+      </form>
+      {% endif %}
+    </div>
+  </aside>
+</div>
+{% endblock %}

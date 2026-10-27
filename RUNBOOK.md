@@ -1,17 +1,17 @@
 # SupportFlow runbook
 
-What to check when something goes wrong. Start with the two monitoring endpoints:
+What to check when something goes wrong. Start with the two monitoring endpoints. Both need the admin key: `curl -H "Authorization: Bearer $ADMIN_API_KEY" http://localhost:8000/failures`, or use **Authorize** in http://localhost:8000/docs.
 
-- `GET /failures` shows each failure with its **stage** (`parse`, `classify` or `notify`) and the error.
-- `GET /events` shows each event's **status**: `received`, `classified`, `notified`, `failed` or `notify_failed`.
+- `GET /failures` shows each failure with its **stage** (`parse`, `classify`, `draft` or `notify`) and the error.
+- `GET /events` shows each event's **status** (`received`, `classified`, `notified`, `failed`, `notify_failed` or `dead`), how many times it has run (`attempts`) and when it will be retried next (`next_attempt_at`, empty when nothing is scheduled).
 
-The server log (the terminal running `uvicorn`) has a line for every accepted, rejected, classified and notified event.
+The server log (the terminal running `uvicorn`) has a line for every accepted, rejected, classified and notified event. With `LOG_FORMAT=json`, filter on `event_id` to see everything that happened to one event, or on `request_id` (also returned in the `X-Request-ID` response header) for one request. `/metrics` shows queue depth and lag, events by status, and recent failures by stage.
 
-Most failures can be retried once the cause is fixed, without re-sending anything from Tally:
+Failed events are retried automatically with exponential backoff (30 seconds, then 1, 2, 4 minutes and so on, up to an hour), so a short Ollama or Slack outage fixes itself. After `JOB_MAX_ATTEMPTS` runs (5 by default) the event is marked `dead`. Once the cause is fixed, queue dead events again without re-sending anything from Tally:
 
 ```bash
-python scripts/replay_events.py --dry-run   # what would be replayed
-python scripts/replay_events.py             # replay every unfinished event
+python scripts/replay_events.py --dry-run          # what would be replayed
+python scripts/replay_events.py --status dead      # queue and run them now
 ```
 
 Classified events are not sent to the LLM again, and notified events are never touched. Events updated in the last 5 minutes are skipped, so the script is safe to run while the server is up.
@@ -35,6 +35,14 @@ The log says `rejected webhook with invalid signature`.
 3. Restart the server after editing `.env`; settings are read at startup.
 4. To test the server on its own, run `python scripts/send_test_webhook.py`. It signs requests with your `.env` secret, so a `202` there means the server is fine and the mismatch is in Tally.
 
+## `/events` or `/failures` return 401
+
+The startup log says `ADMIN_API_KEY is not set` when the key is empty or still `change-me`. Otherwise the `Authorization` header is missing, isn't `Bearer <key>`, or the key doesn't match `.env`. Restart the server after editing `.env`.
+
+## Webhooks are rejected with 413
+
+The body was larger than `MAX_WEBHOOK_BODY_BYTES` (256 KB by default). Real Tally submissions are a few kilobytes, so this usually means something other than Tally is calling the URL.
+
 ## Webhooks are rejected with 400 or 422
 
 - `400`: the body is not JSON, or `eventId` is missing or longer than 128 characters. The log line starting `rejected webhook:` says which. This should not happen with real Tally deliveries.
@@ -42,7 +50,13 @@ The log says `rejected webhook with invalid signature`.
 
 ## Events are stuck in `received`
 
-Classification never finished. Usually the server restarted while the event was being processed, or the process crashed. Check the log for `unexpected error while processing event`, then run `python scripts/replay_events.py --status received`.
+If `next_attempt_at` is set, the event is queued: is a worker running? The startup log should say `worker started`. With `RUN_WORKER_IN_PROCESS=false`, start one with `python -m app.worker`. If a worker died while holding the event, another takes it over once the lease (`JOB_LEASE_SECONDS`, 10 minutes by default) runs out.
+
+If `next_attempt_at` is empty, the event predates the job queue. Run `python scripts/replay_events.py --status received`.
+
+## Events end in `dead`
+
+The worker gave up after `JOB_MAX_ATTEMPTS` runs. `/failures` has one row per failed run, and the `stage` tells you which section below applies. Fix the cause, then run `python scripts/replay_events.py --status dead`.
 
 ## Events end in `failed` (stage `classify`)
 
@@ -55,8 +69,12 @@ The LLM step failed twice. The error in `/failures` says why:
 | `timed out` | The model is too slow on this machine | Raise `LLM_TIMEOUT_SECONDS`, close other heavy apps, or use a smaller model |
 | `not valid JSON` / `field '...'` | The model answered in the wrong format twice | Try the message with `python scripts/try_classifier.py "..."`; consider a larger model |
 | `Unexpected response shape` | Ollama answered, but not in the chat API format | Check `OLLAMA_URL` points at Ollama itself, not a proxy or another service |
+| `rejected the key` | `ANTHROPIC_API_KEY` is missing or wrong | Create a key at https://console.anthropic.com and set it in `.env` |
+| `Anthropic API rate limit` / `HTTP 5xx` / `Could not reach the Anthropic API` | Claude is busy or unreachable | Usually temporary; the job queue retries with backoff. Check https://status.anthropic.com |
+| `declined to classify` | A safety classifier refused the message even after the server-side fallback | Look at the message; it is likely abusive or spam. Mark it by hand |
+| `ran out of output tokens` | The answer was cut off | Rare for classification; lower `ANTHROPIC_EFFORT` |
 
-After fixing the cause, run `python scripts/replay_events.py --status failed`.
+These are retried automatically. If the event ended up `dead`, run `python scripts/replay_events.py --status dead` after fixing the cause.
 
 ## Events end in `notify_failed` (stage `notify`)
 
@@ -69,7 +87,42 @@ Classification worked, Slack didn't.
 | `HTTP 403` / `invalid_token` | The Slack app was removed from the channel | Reinstall the app to the workspace |
 | `after 3 attempts` + `429` / `5xx` / `network error` | Slack or the network was down | Usually temporary; check https://status.slack.com |
 
-Run `python scripts/test_slack.py` to test the Slack connection on its own. Once it works (restart the server if you changed `.env`), resend the missed notifications with `python scripts/replay_events.py --status notify_failed`.
+Run `python scripts/test_slack.py` to test the Slack connection on its own. Once it works (restart the server if you changed `.env`), the next automatic retry sends it. For events that already ended `dead`, run `python scripts/replay_events.py --status dead`.
+
+## No suggested reply on a ticket (stage `draft`)
+
+Drafting runs after classification and never blocks it, so the ticket still arrives in Slack and the inbox without a draft. Look for a `draft` failure in `/failures`: it is usually the same LLM problem as a `classify` failure (see above). A ticket that has a failed draft isn't drafted again; reply by hand. No draft is written for spam, for tickets that are no longer open or when `DRAFT_REPLIES=false`. With an empty `knowledge/` folder every draft is flagged for checking.
+
+Drafts flagged "check before sending" mean the model or the knowledge search found no policy covering the question. Add a `##` section to the right file in `knowledge/` and restart the server; the files are read at startup.
+
+## Replies won't send
+
+The dashboard shows the error on the ticket page, `POST /tickets/{id}/reply` returns `409` with it, and the failed reply is kept in the ticket's history.
+
+| Error contains | Meaning | Fix |
+|---|---|---|
+| `email is not configured` | `SMTP_HOST` or `SMTP_FROM` is empty | Set them in `.env` and restart |
+| `left no email address` | The Tally form had no email field, or it was empty | Contact the customer another way, then resolve the ticket |
+| `Authentication` / `535` | Wrong SMTP username or password (Gmail needs an app password) | Fix `SMTP_USERNAME` / `SMTP_PASSWORD` |
+| `Connection refused` / `timed out` | Wrong host or port, or the provider blocks the port | Port 587 uses STARTTLS, 465 uses SSL; check with your provider |
+
+## Slack buttons do nothing or say "dispatch_failed"
+
+- Slack must reach `<PUBLIC_URL>/slack/interactions` over the internet. Check the request URL under **Interactivity** in the Slack app.
+- A `401` in the server log means the signature check failed: `SLACK_SIGNING_SECRET` doesn't match the app's **Signing Secret**, or the server clock is more than 5 minutes off.
+- Buttons only appear when `SLACK_SIGNING_SECRET` is set, and only on messages posted after that.
+- The result of a click is posted in the channel. ":warning: there is no unsent suggested reply any more" means someone already replied from the dashboard.
+
+## No SLA reminders in Slack
+
+Reminders are posted by the worker (in-process or `python -m app.worker`) once a minute, only when Slack is configured, only for urgencies with a non-zero `SLA_*_MINUTES`, and once per ticket. A ticket that has had any reply, or is `pending` or `resolved`, isn't escalated.
+
+## Can't sign in to the dashboard
+
+- "The dashboard is turned off" means `DASHBOARD_PASSWORD` is not set. A password shorter than 12 characters stops the server at startup with an error saying so.
+- After 5 wrong passwords from one address, sign-in is blocked for 5 minutes.
+- Changing `SESSION_SECRET` (or `ADMIN_API_KEY` when no session secret is set) signs everyone out.
+- Behind `PUBLIC_URL=https://...` cookies are marked Secure, so the dashboard must be opened over https.
 
 ## Resetting local data
 

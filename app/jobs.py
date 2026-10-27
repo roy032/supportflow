@@ -13,6 +13,7 @@ up. This works the same on SQLite and Postgres, and needs no extra infrastructur
 import logging
 import random
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -193,13 +194,33 @@ class JobRunner:
 
 
 class Worker:
-    """Polls for due events in a loop until `stop()` is called."""
+    """Polls for due events in a loop until `stop()` is called. Also runs `periodic` tasks,
+    given as (interval_seconds, function) pairs, between polls."""
 
-    def __init__(self, runner: JobRunner, poll_seconds: float = 2.0, batch_size: int = 10) -> None:
+    def __init__(
+        self,
+        runner: JobRunner,
+        poll_seconds: float = 2.0,
+        batch_size: int = 10,
+        periodic: list[tuple[float, Callable[[], object]]] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.runner = runner
         self.poll_seconds = poll_seconds
         self.batch_size = batch_size
+        self.periodic = periodic or []
+        self._clock = clock
+        self._last_run = [float("-inf")] * len(self.periodic)
         self._stop = threading.Event()
+
+    def run_periodic(self) -> None:
+        for i, (interval, task) in enumerate(self.periodic):
+            if self._clock() - self._last_run[i] >= interval:
+                self._last_run[i] = self._clock()
+                try:
+                    task()
+                except Exception:  # noqa: BLE001 - one failing task must not stop the worker
+                    logger.exception("periodic task %s failed", getattr(task, "__name__", task))
 
     def run_forever(self) -> None:
         logger.info("worker started (polling every %.1fs)", self.poll_seconds)
@@ -209,6 +230,7 @@ class Worker:
             except Exception:  # noqa: BLE001 - e.g. the database is briefly unreachable
                 logger.exception("worker poll failed")
                 ran = 0
+            self.run_periodic()
             if ran < self.batch_size:
                 self._stop.wait(self.poll_seconds)
         logger.info("worker stopped")

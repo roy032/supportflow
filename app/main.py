@@ -91,7 +91,13 @@ def create_app(
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         worker = None
         if settings.run_worker_in_process:
-            worker = Worker(runner, poll_seconds=settings.worker_poll_seconds)
+            from app.escalation import periodic_tasks
+
+            worker = Worker(
+                runner,
+                poll_seconds=settings.worker_poll_seconds,
+                periodic=periodic_tasks(settings, session_factory),
+            )
             worker.start_thread()
         yield
         if worker is not None:
@@ -273,6 +279,31 @@ def create_app(
                 }
                 for f in rows
             ]
+
+    # Helpdesk: tickets API, Slack buttons and the agent dashboard.
+    from app import api_tickets, dashboard, slack_actions
+    from app.mailer import build_mailer
+
+    mailer = build_mailer(settings)
+    app.include_router(
+        api_tickets.build_router(session_factory, require_admin, mailer, settings.shop_name)
+    )
+    if settings.slack_signing_secret:
+        app.include_router(
+            slack_actions.build_router(
+                session_factory, settings.slack_signing_secret, mailer, settings.shop_name
+            )
+        )
+    app.include_router(
+        dashboard.build_router(
+            session_factory,
+            password=settings.dashboard_password,
+            secret=settings.session_secret or settings.admin_api_key,
+            mailer=mailer,
+            shop_name=settings.shop_name,
+            secure_cookies=settings.public_url.startswith("https://"),
+        )
+    )
 
     return app
 

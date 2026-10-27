@@ -2,7 +2,7 @@
 
 What to check when something goes wrong. Start with the two monitoring endpoints. Both need the admin key: `curl -H "Authorization: Bearer $ADMIN_API_KEY" http://localhost:8000/failures`, or use **Authorize** in http://localhost:8000/docs.
 
-- `GET /failures` shows each failure with its **stage** (`parse`, `classify` or `notify`) and the error.
+- `GET /failures` shows each failure with its **stage** (`parse`, `classify`, `draft` or `notify`) and the error.
 - `GET /events` shows each event's **status** (`received`, `classified`, `notified`, `failed`, `notify_failed` or `dead`), how many times it has run (`attempts`) and when it will be retried next (`next_attempt_at`, empty when nothing is scheduled).
 
 The server log (the terminal running `uvicorn`) has a line for every accepted, rejected, classified and notified event. With `LOG_FORMAT=json`, filter on `event_id` to see everything that happened to one event, or on `request_id` (also returned in the `X-Request-ID` response header) for one request. `/metrics` shows queue depth and lag, events by status, and recent failures by stage.
@@ -88,6 +88,41 @@ Classification worked, Slack didn't.
 | `after 3 attempts` + `429` / `5xx` / `network error` | Slack or the network was down | Usually temporary; check https://status.slack.com |
 
 Run `python scripts/test_slack.py` to test the Slack connection on its own. Once it works (restart the server if you changed `.env`), the next automatic retry sends it. For events that already ended `dead`, run `python scripts/replay_events.py --status dead`.
+
+## No suggested reply on a ticket (stage `draft`)
+
+Drafting runs after classification and never blocks it, so the ticket still arrives in Slack and the inbox without a draft. Look for a `draft` failure in `/failures`: it is usually the same LLM problem as a `classify` failure (see above). A ticket that has a failed draft isn't drafted again; reply by hand. No draft is written for spam, for tickets that are no longer open or when `DRAFT_REPLIES=false`. With an empty `knowledge/` folder every draft is flagged for checking.
+
+Drafts flagged "check before sending" mean the model or the knowledge search found no policy covering the question. Add a `##` section to the right file in `knowledge/` and restart the server; the files are read at startup.
+
+## Replies won't send
+
+The dashboard shows the error on the ticket page, `POST /tickets/{id}/reply` returns `409` with it, and the failed reply is kept in the ticket's history.
+
+| Error contains | Meaning | Fix |
+|---|---|---|
+| `email is not configured` | `SMTP_HOST` or `SMTP_FROM` is empty | Set them in `.env` and restart |
+| `left no email address` | The Tally form had no email field, or it was empty | Contact the customer another way, then resolve the ticket |
+| `Authentication` / `535` | Wrong SMTP username or password (Gmail needs an app password) | Fix `SMTP_USERNAME` / `SMTP_PASSWORD` |
+| `Connection refused` / `timed out` | Wrong host or port, or the provider blocks the port | Port 587 uses STARTTLS, 465 uses SSL; check with your provider |
+
+## Slack buttons do nothing or say "dispatch_failed"
+
+- Slack must reach `<PUBLIC_URL>/slack/interactions` over the internet. Check the request URL under **Interactivity** in the Slack app.
+- A `401` in the server log means the signature check failed: `SLACK_SIGNING_SECRET` doesn't match the app's **Signing Secret**, or the server clock is more than 5 minutes off.
+- Buttons only appear when `SLACK_SIGNING_SECRET` is set, and only on messages posted after that.
+- The result of a click is posted in the channel. ":warning: there is no unsent suggested reply any more" means someone already replied from the dashboard.
+
+## No SLA reminders in Slack
+
+Reminders are posted by the worker (in-process or `python -m app.worker`) once a minute, only when Slack is configured, only for urgencies with a non-zero `SLA_*_MINUTES`, and once per ticket. A ticket that has had any reply, or is `pending` or `resolved`, isn't escalated.
+
+## Can't sign in to the dashboard
+
+- "The dashboard is turned off" means `DASHBOARD_PASSWORD` is not set. A password shorter than 12 characters stops the server at startup with an error saying so.
+- After 5 wrong passwords from one address, sign-in is blocked for 5 minutes.
+- Changing `SESSION_SECRET` (or `ADMIN_API_KEY` when no session secret is set) signs everyone out.
+- Behind `PUBLIC_URL=https://...` cookies are marked Secure, so the dashboard must be opened over https.
 
 ## Resetting local data
 

@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Support{% endblock %} · {{ shop_name }}</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #667085; --line: #e3e6eb;
+  --accent: #2f6fed; --accent-text: #ffffff; --high: #c4320a; --high-bg: #fff1ec;
+  --medium: #a15c07; --medium-bg: #fff8e6; --low: #3f6212; --low-bg: #f1f8e9;
+  --warn-bg: #fff8e6; --ok-bg: #edf7ee; --err-bg: #fdecec;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #11141a; --panel: #1a1f27; --text: #e7e9ee; --muted: #9aa3b2; --line: #2b313c;
+    --accent: #6d9bff; --accent-text: #0b1020; --high: #ff8a65; --high-bg: #3a1d14;
+    --medium: #f5c46b; --medium-bg: #33280f; --low: #a3d977; --low-bg: #1e2a14;
+    --warn-bg: #33280f; --ok-bg: #16281a; --err-bg: #3a1717;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", "Noto Sans Bengali", sans-serif;
+       background: var(--bg); color: var(--text); }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+header { display: flex; align-items: center; gap: 16px; padding: 12px 24px; background: var(--panel);
+         border-bottom: 1px solid var(--line); }
+header .brand { font-weight: 650; }
+header .spacer { flex: 1; }
+header form { margin: 0; }
+main { max-width: 1100px; margin: 0 auto; padding: 24px 16px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+.muted { color: var(--muted); }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600;
+         border: 1px solid var(--line); white-space: nowrap; }
+.u-high { color: var(--high); background: var(--high-bg); border-color: transparent; }
+.u-medium { color: var(--medium); background: var(--medium-bg); border-color: transparent; }
+.u-low { color: var(--low); background: var(--low-bg); border-color: transparent; }
+button, .button { font: inherit; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--line);
+         background: var(--panel); color: var(--text); cursor: pointer; }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+button.link { border: 0; background: none; color: var(--accent); padding: 0; }
+input[type=text], input[type=password], input[type=search], select, textarea {
+  font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 8px; padding: 7px 10px; }
+textarea { width: 100%; min-height: 180px; resize: vertical; }
+.flash { padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; }
+.flash.ok { background: var(--ok-bg); } .flash.err { background: var(--err-bg); } .flash.warn { background: var(--warn-bg); }
+@media (max-width: 700px) { header { padding: 12px 16px; flex-wrap: wrap; } }
+</style>
+</head>
+<body>
+<header>
+  <a class="brand" href="/dashboard/tickets">{{ shop_name }} support</a>
+  <span class="spacer"></span>
+  {% if agent %}
+  <span class="muted">{{ agent }}</span>
+  <form method="post" action="/dashboard/logout"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="link">Sign out</button></form>
+  {% endif %}
+</header>
+<main>{% block content %}{% endblock %}</main>
+</body>
+</html>

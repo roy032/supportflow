@@ -13,6 +13,7 @@ COPY --from=build /install /usr/local
 COPY app ./app
 COPY scripts ./scripts
 COPY alembic.ini ./
+COPY knowledge ./knowledge
 
 # Never run as root inside the container.
 RUN useradd --system --uid 10001 supportflow && chown -R supportflow /srv

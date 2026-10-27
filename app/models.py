@@ -2,7 +2,9 @@
 
 events           one row per accepted webhook (raw payload kept for replay/debugging); also
                  the job queue: next_attempt_at says when a worker should (re)process it
+                 and the support ticket: ticket_status, assignee and response timestamps
 classifications  the LLM's structured output for an event
+replies          AI drafts and replies sent to the customer
 failures         anything that went wrong, with the pipeline stage it happened in
 """
 
@@ -29,6 +31,23 @@ class EventStatus:
     DEAD = "dead"
 
 
+class TicketStatus:
+    """Where the conversation with the customer stands (independent of the pipeline)."""
+
+    OPEN = "open"  # needs an answer from the shop
+    PENDING = "pending"  # answered; waiting on the customer
+    RESOLVED = "resolved"
+
+    ALL = (OPEN, PENDING, RESOLVED)
+
+
+class ReplyStatus:
+    DRAFT = "draft"  # written by the AI, not sent
+    SENT = "sent"
+    FAILED = "failed"  # sending failed; can be retried
+    DISCARDED = "discarded"  # a draft superseded by a reply the agent wrote
+
+
 class Event(Base):
     __tablename__ = "events"
 
@@ -49,6 +68,18 @@ class Event(Base):
         DateTime(timezone=True), nullable=True, index=True
     )
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Support ticket.
+    ticket_status: Mapped[str] = mapped_column(
+        String(16), default=TicketStatus.OPEN, server_default=TicketStatus.OPEN, index=True
+    )
+    assignee: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    first_response_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # When the SLA escalation was posted, so it is posted once.
+    escalated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
@@ -60,6 +91,12 @@ class Event(Base):
     failures: Mapped[list["Failure"]] = relationship(
         back_populates="event", cascade="all, delete-orphan"
     )
+    replies: Mapped[list["Reply"]] = relationship(
+        back_populates="event", cascade="all, delete-orphan", order_by="Reply.id"
+    )
+
+    def draft(self) -> "Reply | None":
+        return next((r for r in reversed(self.replies) if r.status == ReplyStatus.DRAFT), None)
 
 
 class Classification(Base):
@@ -82,6 +119,26 @@ class Classification(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     event: Mapped[Event] = relationship(back_populates="classification")
+
+
+class Reply(Base):
+    __tablename__ = "replies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), index=True)
+    status: Mapped[str] = mapped_column(String(16), default=ReplyStatus.DRAFT)
+    body: Mapped[str] = mapped_column(Text)
+    # "ai" for drafts, otherwise who sent it (dashboard user or Slack user).
+    author: Mapped[str] = mapped_column(String(100))
+    # For AI drafts: the model, and whether it thinks a person should look first.
+    model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    needs_human: Mapped[bool] = mapped_column(default=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    event: Mapped[Event] = relationship(back_populates="replies")
 
 
 class Failure(Base):

@@ -9,6 +9,7 @@ import signal
 
 from app.config import get_settings
 from app.db import init_db, make_engine, make_session_factory
+from app.escalation import periodic_tasks
 from app.jobs import JobRunner, RetryPolicy, Worker
 from app.observability import configure_logging
 from app.pipeline import build_processor
@@ -24,7 +25,11 @@ def main() -> None:
     runner = JobRunner(
         session_factory, build_processor(settings, session_factory), RetryPolicy.from_settings(settings)
     )
-    worker = Worker(runner, poll_seconds=settings.worker_poll_seconds)
+    worker = Worker(
+        runner,
+        poll_seconds=settings.worker_poll_seconds,
+        periodic=periodic_tasks(settings, session_factory),
+    )
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: worker.stop())
     worker.run_forever()

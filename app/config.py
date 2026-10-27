@@ -1,6 +1,7 @@
 """Application settings, loaded from environment variables and `.env`."""
 
 import logging
+from datetime import timedelta
 from functools import lru_cache
 from typing import Literal
 
@@ -40,6 +41,36 @@ class Settings(BaseSettings):
     anthropic_effort: Literal["low", "medium", "high", "xhigh", "max"] = "low"
 
     slack_webhook_url: str = ""
+    # Signing secret of the Slack app, for the buttons on Slack messages
+    # (POST /slack/interactions). Empty: messages are sent without buttons.
+    slack_signing_secret: str = ""
+
+    # Helpdesk.
+    shop_name: str = "Our shop"
+    # Where the dashboard is reachable, for links in Slack (e.g. https://support.example.com).
+    public_url: str = ""
+    # Policy documents the AI reply drafts are written from.
+    knowledge_dir: str = "knowledge"
+    draft_replies: bool = True
+    # Spam is resolved as soon as it is classified, so it never sits in the inbox.
+    auto_resolve_spam: bool = True
+    # Minutes an open, unanswered ticket may wait before Slack is told, per urgency.
+    # 0 turns escalation off for that urgency.
+    sla_high_minutes: int = Field(default=60, ge=0)
+    sla_medium_minutes: int = Field(default=240, ge=0)
+    sla_low_minutes: int = Field(default=0, ge=0)
+
+    # Outgoing email for replies to customers.
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    smtp_starttls: bool = True
+
+    # Dashboard sign-in. Sessions are signed with SESSION_SECRET (falls back to ADMIN_API_KEY).
+    dashboard_password: str = ""
+    session_secret: str = ""
 
     # Job queue (see app/jobs.py). An event is run at most JOB_MAX_ATTEMPTS times
     # automatically, waiting JOB_RETRY_BASE_SECONDS * 2^n (capped) between runs.
@@ -59,13 +90,17 @@ class Settings(BaseSettings):
 
     @field_validator(
         "tally_signing_secret", "admin_api_key", "slack_webhook_url", "anthropic_api_key",
-        mode="before",
+        "slack_signing_secret", "smtp_password", "dashboard_password", "session_secret",
+        "public_url", mode="before",
     )
     @classmethod
     def _strip(cls, value: object) -> object:
         return value.strip() if isinstance(value, str) else value
 
-    @field_validator("tally_signing_secret", "admin_api_key")
+    @field_validator(
+        "tally_signing_secret", "admin_api_key", "slack_signing_secret", "dashboard_password",
+        "session_secret",
+    )
     @classmethod
     def _placeholder_is_unset(cls, value: str) -> str:
         return "" if value == PLACEHOLDER_SECRET else value
@@ -79,6 +114,26 @@ class Settings(BaseSettings):
                 "generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
             )
         return value
+
+    @field_validator("public_url")
+    @classmethod
+    def _no_trailing_slash(cls, value: str) -> str:
+        return value.rstrip("/")
+
+    @field_validator("dashboard_password")
+    @classmethod
+    def _dashboard_password_is_long_enough(cls, value: str) -> str:
+        if value and len(value) < 12:
+            raise ValueError("DASHBOARD_PASSWORD must be at least 12 characters")
+        return value
+
+    def sla(self) -> dict[str, timedelta]:
+        minutes = {
+            "high": self.sla_high_minutes,
+            "medium": self.sla_medium_minutes,
+            "low": self.sla_low_minutes,
+        }
+        return {u: timedelta(minutes=m) for u, m in minutes.items() if m > 0}
 
     @model_validator(mode="after")
     def _lease_outlasts_a_run(self) -> "Settings":

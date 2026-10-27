@@ -1,6 +1,6 @@
 # SupportFlow
 
-An AI support-automation pipeline. Customer messages arrive from a Tally form as signed webhooks, an LLM classifies each one into structured fields, and a summary is posted to Slack. Every step is stored, and every failure is recorded with the stage where it happened.
+A small AI helpdesk for an online shop. Customer messages arrive from a Tally form as signed webhooks. An LLM classifies each one and drafts a reply from the shop's own policy documents. The team gets the ticket in Slack and in a web inbox, checks or edits the draft, and sends it to the customer by email in one click. Tickets that wait too long are escalated. Every step is stored, and every failure is recorded with the stage where it happened.
 
 Messages can be in English, Bangla, or a mix of both.
 
@@ -29,6 +29,15 @@ flowchart LR
 4. **Retries.** If either step fails, the event is retried automatically with exponential backoff. After `JOB_MAX_ATTEMPTS` runs it is marked `dead` for a person to look at.
 5. **Monitoring.** `/events` shows recent events and their status; `/failures` shows what went wrong and where.
 
+### The helpdesk
+
+- **Tickets.** Every message is a ticket: `open` (needs a reply), `pending` (we replied, waiting on the customer) or `resolved`. Tickets can be assigned to a person. Spam is resolved automatically (`AUTO_RESOLVE_SPAM`).
+- **Suggested replies.** After classification, the AI writes a draft using only the sections of `knowledge/*.md` that match the message, in the customer's language. It flags drafts a person must check first: no matching policy, an angry customer, or anything that needs an order looked up. Drafts are never sent on their own. Edit the Markdown files to teach it your policies (see [knowledge/README.md](knowledge/README.md)).
+- **Email replies.** Replies go to the customer over SMTP from the dashboard, the API or Slack. A failed send is kept with its error and the ticket stays open.
+- **Slack buttons.** With a Slack app's signing secret set, each Slack message shows the draft with **Send suggested reply** (asks for confirmation), **Resolve** and **Open ticket** buttons.
+- **SLA escalation.** When a ticket has had no reply for longer than its urgency allows (`SLA_HIGH_MINUTES`, `SLA_MEDIUM_MINUTES`, `SLA_LOW_MINUTES`), the worker posts one reminder to Slack.
+- **Dashboard.** `/dashboard` is a sign-in-protected inbox, urgent and oldest first, with filters, search, "assigned to me", and a ticket page showing the message, the classification, the draft and the reply history.
+
 ## Tech stack
 
 Python, FastAPI, SQLAlchemy 2.0 with Alembic migrations (SQLite locally, Postgres-ready), Pydantic, httpx, Ollama (local LLM, `qwen2.5:3b` by default) or Claude through the Anthropic SDK, Prometheus metrics, Slack incoming webhooks, pytest, GitHub Actions.
@@ -49,6 +58,8 @@ Python, FastAPI, SQLAlchemy 2.0 with Alembic migrations (SQLite locally, Postgre
 - **Safe to re-run.** An event that is already classified is never sent to the LLM again; if only the Slack step failed, a retry resends the notification without paying for a second classification.
 - **Retry only what can succeed.** Slack calls retry network errors, `429` (honouring `Retry-After`, capped at 30 seconds) and `5xx` with exponential backoff. Other `4xx` errors and a malformed webhook URL fail immediately.
 - **Bounded waits.** Slack calls time out after 10 seconds. Ollama gets `LLM_TIMEOUT_SECONDS` to generate, but only 10 seconds to connect, so an unreachable host fails fast.
+- **Drafts are grounded and never auto-sent.** The drafting prompt only contains policy sections retrieved for that message, and the customer's text is passed as data with an instruction to ignore embedded instructions. If nothing in the knowledge base matched, the draft is always flagged for a person. A draft that fails is recorded as a `draft` failure and never blocks classification or Slack.
+- **Each button click is checked.** Slack requests are verified with Slack's v0 HMAC signature and rejected when older than 5 minutes, so a captured request can't be replayed. The dashboard uses signed, HttpOnly, SameSite cookies, a CSRF token on every form, and a sign-in throttle. Escalations are claimed with a conditional `UPDATE` first, so two workers never post the same reminder.
 - **Forms can change.** Tally fields are matched by label keywords, so the form can be edited without code changes.
 
 ## Getting started
@@ -157,6 +168,13 @@ Migrations run automatically when the server or worker starts. After changing `a
 alembic revision --autogenerate -m "describe the change"
 ```
 
+### Set up the helpdesk
+
+1. **Policies.** Replace the sample files in `knowledge/` with your shop's real refund, shipping and payment rules. Each `##` heading is one searchable section.
+2. **Email.** Set `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` and `SMTP_FROM` for any SMTP provider. Until then, replies can be drafted but not sent.
+3. **Dashboard.** Set `DASHBOARD_PASSWORD` (12+ characters) and open `http://localhost:8000/dashboard`. Sign in with your name and the shared password; your name is recorded on the replies you send.
+4. **Slack buttons (optional).** Create a Slack app at [api.slack.com/apps](https://api.slack.com/apps), turn on **Incoming Webhooks** and use that webhook as `SLACK_WEBHOOK_URL`. Turn on **Interactivity** with the request URL `<PUBLIC_URL>/slack/interactions`, and put the app's **Signing Secret** in `SLACK_SIGNING_SECRET`. Set `PUBLIC_URL` so the **Open ticket** button links to the dashboard.
+
 ### Connect a real Tally form
 
 1. Run `ngrok http 8000` and copy the `https://...` forwarding URL.
@@ -172,6 +190,12 @@ alembic revision --autogenerate -m "describe the change"
 | `GET` | `/events?limit=20` | Recent events with status and classification (admin key) |
 | `GET` | `/failures?limit=20` | Recent failures with pipeline stage and error (admin key) |
 | `GET` | `/metrics` | Prometheus metrics (admin key) |
+| `GET` | `/tickets?status=open` | Ticket inbox; `status` is `open`, `pending`, `resolved` or `all`, with `category`, `urgency`, `assignee`, `q`, `limit`, `offset` filters (admin key) |
+| `GET` | `/tickets/{id}` | One ticket with its classification, draft and replies (admin key) |
+| `PATCH` | `/tickets/{id}` | Change `ticket_status` or `assignee` (admin key) |
+| `POST` | `/tickets/{id}/reply` | Email a reply: `{"body", "author", "resolve"}`; `409` if it can't be sent (admin key) |
+| `POST` | `/slack/interactions` | Slack button clicks, verified with `SLACK_SIGNING_SECRET` |
+| `GET` | `/dashboard` | Agent dashboard (password sign-in) |
 | `GET` | `/health` | Liveness and database check |
 
 Event status moves through `received`, `classified`, `notified`. `failed` (classification) and `notify_failed` (Slack) are retried automatically; after `JOB_MAX_ATTEMPTS` runs the event becomes `dead`. Each event in `/events` also shows `attempts` and `next_attempt_at`.
@@ -183,7 +207,7 @@ pytest -q
 ruff check .
 ```
 
-The suite covers signature verification, idempotency, payload parsing (including Bangla text), settings validation, classifier retries and validation, Slack retry behaviour, replay of unfinished events, the job queue (leases, backoff, dead-lettering), migrations, and the full webhook-to-Slack flow. External services are mocked, so tests need no network, model or Slack workspace.
+The suite covers signature verification, the helpdesk (knowledge search, drafts, sending replies, the inbox, SLA escalation, Slack buttons and the dashboard's sign-in, CSRF and escaping), idempotency, payload parsing (including Bangla text), settings validation, classifier retries and validation, Slack retry behaviour, replay of unfinished events, the job queue (leases, backoff, dead-lettering), migrations, and the full webhook-to-Slack flow. External services are mocked, so tests need no network, model or Slack workspace.
 
 Tests use in-memory SQLite. To run the same suite against Postgres:
 
@@ -210,7 +234,17 @@ app/
   migrations/     Alembic migrations, applied on startup
   replay.py       Find unfinished events and run them through the pipeline again
   slack.py        Slack message formatting and retrying sender
-  models.py       events, classifications, failures tables
+  slack_actions.py  Slack button handler with signature verification
+  knowledge.py    Loads knowledge/*.md and finds the sections that match a message
+  drafting.py     AI reply drafts grounded in those sections
+  helpdesk.py     Ticket inbox, status, assignment and sending replies
+  mailer.py       SMTP email
+  escalation.py   SLA reminders, run by the worker
+  api_tickets.py  /tickets API
+  dashboard.py    Agent dashboard (templates/ holds its pages)
+  web_sessions.py Signed session cookies and CSRF tokens
+  models.py       events (tickets), classifications, replies, failures tables
+knowledge/        Shop policies the AI drafts replies from (samples; replace with yours)
 scripts/          Test webhook sender, Slack test, classifier playground, event replay
 tests/            pytest suite
 RUNBOOK.md        What to check when something breaks
@@ -220,11 +254,13 @@ DEVELOPMENT.md    Conventions and commands for working on the code
 ## Known limitations
 
 - A small local model is fast and free but less accurate than larger models, especially on mixed-language messages.
-- Only Tally is supported as a source so far.
+- Only Tally is supported as a source so far, and customers reply by email outside the app: a customer's answer doesn't reopen the ticket yet.
+- The dashboard has one shared password; there are no per-person accounts or roles.
+- Knowledge search is keyword matching, which works well for a few dozen policy sections but isn't semantic search.
 
 ## Roadmap
 
-- RAG auto-replies for common questions, answered from the shop's policy documents
-- Slack approve/edit buttons before a reply is sent
-- Daily summary report with n8n
+- Receive customer email replies (inbound email webhook) and reopen the ticket
+- More sources: Facebook Messenger and WhatsApp, where most Bangladeshi shops talk to customers
+- Per-person accounts, and a daily summary of volume, response times and top issues
 

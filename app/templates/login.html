@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Sign in{% endblock %}
+{% block content %}
+<div class="panel" style="max-width: 380px; margin: 48px auto; padding: 24px;">
+  <h1 style="margin-top: 0; font-size: 20px;">Sign in</h1>
+  {% if not enabled %}
+    <p class="flash warn">The dashboard is turned off. Set <code>DASHBOARD_PASSWORD</code> (and <code>SESSION_SECRET</code> or <code>ADMIN_API_KEY</code>) and restart the server.</p>
+  {% else %}
+    {% if error %}<p class="flash err">{{ error }}</p>{% endif %}
+    <form method="post" action="/dashboard/login" style="display: grid; gap: 12px;">
+      <label>Your name<br><input type="text" name="agent" required maxlength="100" autocomplete="username" style="width: 100%;"></label>
+      <label>Team password<br><input type="password" name="password" required autocomplete="current-password" style="width: 100%;"></label>
+      <button class="primary">Sign in</button>
+    </form>
+  {% endif %}
+</div>
+{% endblock %}

@@ -5,21 +5,18 @@ RUN_WORKER_IN_PROCESS=false there). Several workers are safe: each event is leas
 to one worker at a time.
 """
 
-import logging
 import signal
 
 from app.config import get_settings
 from app.db import init_db, make_engine, make_session_factory
 from app.jobs import JobRunner, RetryPolicy, Worker
+from app.observability import configure_logging
 from app.pipeline import build_processor
 
 
 def main() -> None:
     settings = get_settings()
-    logging.basicConfig(
-        level=settings.log_level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_logging(settings.log_level, settings.log_format)
     engine = make_engine(settings.database_url)
     init_db(engine)
     session_factory = make_session_factory(engine)

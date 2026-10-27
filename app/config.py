@@ -2,6 +2,7 @@
 
 import logging
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -46,6 +47,8 @@ class Settings(BaseSettings):
     run_worker_in_process: bool = True
 
     log_level: str = "INFO"
+    # "text" for people reading a terminal, "json" for a log pipeline.
+    log_format: Literal["text", "json"] = "text"
 
     @field_validator("tally_signing_secret", "admin_api_key", "slack_webhook_url", mode="before")
     @classmethod

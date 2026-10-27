@@ -5,7 +5,7 @@ What to check when something goes wrong. Start with the two monitoring endpoints
 - `GET /failures` shows each failure with its **stage** (`parse`, `classify` or `notify`) and the error.
 - `GET /events` shows each event's **status** (`received`, `classified`, `notified`, `failed`, `notify_failed` or `dead`), how many times it has run (`attempts`) and when it will be retried next (`next_attempt_at`, empty when nothing is scheduled).
 
-The server log (the terminal running `uvicorn`) has a line for every accepted, rejected, classified and notified event.
+The server log (the terminal running `uvicorn`) has a line for every accepted, rejected, classified and notified event. With `LOG_FORMAT=json`, filter on `event_id` to see everything that happened to one event, or on `request_id` (also returned in the `X-Request-ID` response header) for one request. `/metrics` shows queue depth and lag, events by status, and recent failures by stage.
 
 Failed events are retried automatically with exponential backoff (30 seconds, then 1, 2, 4 minutes and so on, up to an hour), so a short Ollama or Slack outage fixes itself. After `JOB_MAX_ATTEMPTS` runs (5 by default) the event is marked `dead`. Once the cause is fixed, queue dead events again without re-sending anything from Tally:
 

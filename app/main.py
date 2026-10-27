@@ -9,8 +9,9 @@ from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -19,6 +20,7 @@ from app.config import Settings, get_settings
 from app.db import init_db, make_engine, make_session_factory
 from app.jobs import JobRunner, RetryPolicy, Worker
 from app.models import Event, Failure
+from app.observability import Metrics, RequestContextMiddleware, configure_logging
 from app.security import verify_tally_signature
 from app.tally import TallyPayloadError, parse_tally_payload
 
@@ -67,10 +69,7 @@ def create_app(
     processor: Processor | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
-    logging.basicConfig(
-        level=settings.log_level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_logging(settings.log_level, settings.log_format)
     if not settings.tally_signing_secret:
         logger.warning("TALLY_SIGNING_SECRET is not set; every webhook will be rejected with 401")
     if not settings.admin_api_key:
@@ -104,6 +103,8 @@ def create_app(
         version="0.1.0",
         lifespan=lifespan,
     )
+    metrics = Metrics(session_factory)
+    app.add_middleware(RequestContextMiddleware, metrics=metrics)
 
     bearer = HTTPBearer(auto_error=False, description="The ADMIN_API_KEY from .env")
 
@@ -140,12 +141,17 @@ def create_app(
 
     @app.post("/webhooks/tally", status_code=202)
     async def tally_webhook(request: Request, background: BackgroundTasks) -> Any:
-        body = await _read_body(request, settings.max_webhook_body_bytes)
+        try:
+            body = await _read_body(request, settings.max_webhook_body_bytes)
+        except HTTPException as exc:
+            metrics.webhooks.labels("too_large" if exc.status_code == 413 else "invalid").inc()
+            raise
 
         # 1. Authenticity first: nothing is parsed or stored before the signature checks out.
         signature = request.headers.get("tally-signature")
         if not verify_tally_signature(body, signature, settings.tally_signing_secret):
             logger.warning("rejected webhook with invalid signature")
+            metrics.webhooks.labels("unauthorized").inc()
             raise HTTPException(status_code=401, detail="invalid signature")
 
         # 2. Shape checks.
@@ -153,13 +159,16 @@ def create_app(
             payload = json.loads(body)
         except ValueError:
             logger.warning("rejected webhook: body is not valid JSON")
+            metrics.webhooks.labels("invalid").inc()
             raise HTTPException(status_code=400, detail="body is not valid JSON") from None
         if not isinstance(payload, dict) or not payload.get("eventId"):
             logger.warning("rejected webhook: missing eventId")
+            metrics.webhooks.labels("invalid").inc()
             raise HTTPException(status_code=400, detail="missing eventId")
         external_id = str(payload["eventId"])
         if len(external_id) > EXTERNAL_ID_MAX_LENGTH:
             logger.warning("rejected webhook: eventId longer than %s", EXTERNAL_ID_MAX_LENGTH)
+            metrics.webhooks.labels("invalid").inc()
             raise HTTPException(status_code=400, detail="eventId is too long")
 
         try:
@@ -167,6 +176,7 @@ def create_app(
         except TallyPayloadError as exc:
             logger.warning("rejected webhook %s: %s", external_id, exc)
             record_failure("parse", f"{external_id}: {exc}")
+            metrics.webhooks.labels("invalid").inc()
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         # 3. Idempotency: Tally retries deliveries, so the same eventId can arrive twice.
@@ -174,6 +184,7 @@ def create_app(
             existing = session.scalar(select(Event).where(Event.external_id == external_id))
             if existing is not None:
                 logger.info("duplicate webhook %s ignored", external_id)
+                metrics.webhooks.labels("duplicate").inc()
                 return JSONResponse(
                     {"status": "duplicate", "event_id": existing.id}, status_code=200
                 )
@@ -193,6 +204,7 @@ def create_app(
                 # Two deliveries raced past the check above; the unique index caught it.
                 session.rollback()
                 existing = session.scalar(select(Event).where(Event.external_id == external_id))
+                metrics.webhooks.labels("duplicate").inc()
                 return JSONResponse(
                     {"status": "duplicate", "event_id": existing.id if existing else None},
                     status_code=200,
@@ -204,7 +216,12 @@ def create_app(
         # before it runs) a worker retries it with backoff.
         background.add_task(runner.run, event_id)
         logger.info("accepted webhook %s as event %s", external_id, event_id)
+        metrics.webhooks.labels("accepted").inc()
         return {"status": "accepted", "event_id": event_id}
+
+    @app.get("/metrics", dependencies=[Depends(require_admin)], include_in_schema=False)
+    def prometheus_metrics() -> Response:
+        return Response(generate_latest(metrics.registry), media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/events", dependencies=[Depends(require_admin)])
     def list_events(limit: int = Query(20, ge=1, le=200)) -> list[dict[str, Any]]:

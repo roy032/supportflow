@@ -41,6 +41,7 @@ Python, FastAPI, SQLAlchemy 2.0 with Alembic migrations (SQLite locally, Postgre
 - **Idempotent intake.** Webhook senders retry, so the same event can arrive more than once. Tally's `eventId` has a unique index; a repeat delivery returns `200 duplicate` and is not processed again, even if two deliveries race.
 - **Respond fast, work later.** The endpoint only verifies and stores. Classification and Slack run after the response is sent, so a slow model never causes Tally to time out and retry.
 - **No event is lost.** The `events` table doubles as a job queue. A worker claims an event with one conditional `UPDATE` that takes a lease, so two workers never run the same event, and a worker that dies mid-run just lets its lease expire for another to take over. Failed runs are retried with capped, jittered exponential backoff and end in `dead` after `JOB_MAX_ATTEMPTS`. This needs no Redis or broker and behaves the same on SQLite and Postgres. The lease is validated to outlast a worst-case run, so a slow model can't cause a double Slack post.
+- **Observable by default.** Every response carries an `X-Request-ID` (taken from the caller when it is safe, otherwise generated), and every log line written while handling a request or running an event carries its `request_id` / `event_id`. `LOG_FORMAT=json` makes the logs one JSON object per line. `/metrics` serves Prometheus metrics. Queue depth, queue lag, events by status, failures in the last hour and LLM latency are read from the database at scrape time, so the numbers are right however many web servers and workers run.
 - **Schema changes are migrations.** Alembic migrations run on startup, and a database created before migrations existed is detected and upgraded in place.
 - **Structured, validated LLM output.** The model is constrained to a JSON schema, and the result is validated again with Pydantic. Invalid output gets one retry that tells the model what was wrong; if it still fails, the failure is recorded instead of crashing the worker.
 - **Provider interface.** The pipeline talks to an `LLMProvider` interface. Ollama keeps the project free and offline; a cloud model is a new class and one setting, with no pipeline changes.
@@ -122,6 +123,21 @@ python scripts/replay_events.py --event-id 12           # one event
 
 Only events last updated at least 5 minutes ago are picked, so work the server is still doing is left alone. Notified events are never touched.
 
+### Monitoring with Prometheus
+
+Point Prometheus at `/metrics` with the admin key:
+
+```yaml
+scrape_configs:
+  - job_name: supportflow
+    authorization:
+      credentials: <ADMIN_API_KEY>
+    static_configs:
+      - targets: ["supportflow:8000"]
+```
+
+Good first alerts: `supportflow_queue_lag_seconds > 600` (workers are down or falling behind), `increase(supportflow_events{status="dead"}[1h]) > 0`, and a rising `supportflow_failures_last_hour`.
+
 ### Database migrations
 
 Migrations run automatically when the server or worker starts. After changing `app/models.py`, generate a migration and review it before committing:
@@ -144,6 +160,7 @@ alembic revision --autogenerate -m "describe the change"
 | `POST` | `/webhooks/tally` | Receive a signed Tally webhook (`202` accepted, `200` duplicate, `401` bad signature, `400`/`422` bad payload, `413` too large) |
 | `GET` | `/events?limit=20` | Recent events with status and classification (admin key) |
 | `GET` | `/failures?limit=20` | Recent failures with pipeline stage and error (admin key) |
+| `GET` | `/metrics` | Prometheus metrics (admin key) |
 | `GET` | `/health` | Liveness and database check |
 
 Event status moves through `received`, `classified`, `notified`. `failed` (classification) and `notify_failed` (Slack) are retried automatically; after `JOB_MAX_ATTEMPTS` runs the event becomes `dead`. Each event in `/events` also shows `attempts` and `next_attempt_at`.
@@ -177,6 +194,7 @@ app/
   pipeline.py     Classify -> store -> notify, with failure recording
   jobs.py         Job queue on the events table: leases, retries with backoff, dead-lettering
   worker.py       Standalone worker process: python -m app.worker
+  observability.py  JSON logs, request ids, Prometheus metrics
   migrations/     Alembic migrations, applied on startup
   replay.py       Find unfinished events and run them through the pipeline again
   slack.py        Slack message formatting and retrying sender

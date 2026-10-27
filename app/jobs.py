@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings
 from app.models import Event, EventStatus
+from app.observability import event_id_var
 
 logger = logging.getLogger("supportflow.jobs")
 
@@ -153,11 +154,14 @@ class JobRunner:
         """Run one event if it is due and nobody else holds it. Returns whether it ran."""
         if not self._claim(event_id):
             return False
+        token = event_id_var.set(event_id)  # attached to every log line of this run
         try:
             self.process(event_id)
         except Exception:  # noqa: BLE001 - the lease must be released whatever happens
             logger.exception("unexpected error while processing event %s", event_id)
-        self._finish(event_id)
+        finally:
+            self._finish(event_id)
+            event_id_var.reset(token)
         return True
 
     def run_due(self, limit: int = 10) -> int:

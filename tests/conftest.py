@@ -1,6 +1,7 @@
 """Shared test fixtures. No test touches the network or the real database."""
 
 import json
+import os
 import uuid
 from typing import Any
 
@@ -60,16 +61,32 @@ def settings() -> Settings:
     )
 
 
+def make_test_engine():
+    """A fresh, empty database for one test.
+
+    In-memory SQLite by default. Set TEST_DATABASE_URL to a Postgres URL (as CI does) to
+    run the same tests against Postgres; its public schema is wiped for every test.
+    """
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.pool import NullPool, StaticPool
+
+    url = os.environ.get("TEST_DATABASE_URL")
+    if not url:
+        return create_engine(
+            "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+        )
+    engine = create_engine(url, poolclass=NullPool)
+    with engine.begin() as connection:
+        connection.execute(text("DROP SCHEMA public CASCADE"))
+        connection.execute(text("CREATE SCHEMA public"))
+    return engine
+
+
 @pytest.fixture
 def session_factory():
-    from sqlalchemy import create_engine
-    from sqlalchemy.pool import StaticPool
-
     from app.db import init_db, make_session_factory
 
-    # One shared in-memory database per test.
-    engine = create_engine(
-        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
-    )
+    engine = make_test_engine()
     init_db(engine)
-    return make_session_factory(engine)
+    yield make_session_factory(engine)
+    engine.dispose()

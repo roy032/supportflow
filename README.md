@@ -88,6 +88,17 @@ curl -H "Authorization: Bearer $ADMIN_API_KEY" http://localhost:8000/events
 
 Or open http://localhost:8000/docs, click **Authorize**, paste the key, and call `/events` from there.
 
+### Run with Docker (Postgres, web server and worker)
+
+```bash
+cp .env.example .env               # set TALLY_SIGNING_SECRET, ADMIN_API_KEY, SLACK_WEBHOOK_URL
+docker compose up --build          # uses Ollama running on your machine
+```
+
+This starts Postgres, the web server on port 8000 and a separate worker process. Migrations run on startup; an advisory lock makes sure only one process applies them. To run Ollama in a container as well: `DOCKER_OLLAMA_URL=http://ollama:11434 docker compose --profile ollama up`, then `docker compose exec ollama ollama pull qwen2.5:3b`.
+
+The image runs as a non-root user and has a health check against `/health`.
+
 ### Run the worker separately (production)
 
 By default a worker thread runs inside the web server, which is all you need locally. In production, set `RUN_WORKER_IN_PROCESS=false` for the web server and run one or more workers next to it:
@@ -144,7 +155,15 @@ pytest -q
 ruff check .
 ```
 
-The suite covers signature verification, idempotency, payload parsing (including Bangla text), settings validation, classifier retries and validation, Slack retry behaviour, replay of unfinished events, and the full webhook-to-Slack flow. External services are mocked, so tests need no network, model or Slack workspace. GitHub Actions runs ruff and the tests on Python 3.11 to 3.13 on every push.
+The suite covers signature verification, idempotency, payload parsing (including Bangla text), settings validation, classifier retries and validation, Slack retry behaviour, replay of unfinished events, the job queue (leases, backoff, dead-lettering), migrations, and the full webhook-to-Slack flow. External services are mocked, so tests need no network, model or Slack workspace.
+
+Tests use in-memory SQLite. To run the same suite against Postgres:
+
+```bash
+TEST_DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/supportflow_test pytest -q
+```
+
+GitHub Actions runs ruff, the tests on Python 3.11 to 3.13, the tests against Postgres 16, and a Docker build that must start and pass `/health`, on every push.
 
 ## Project layout
 
@@ -177,7 +196,6 @@ DEVELOPMENT.md    Conventions and commands for working on the code
 
 - RAG auto-replies for common questions, answered from the shop's policy documents
 - Slack approve/edit buttons before a reply is sent
-- Postgres and Docker Compose setup
 - Daily summary report with n8n
 - Evaluation set of labelled messages, comparing local and cloud models on accuracy, latency and cost
 

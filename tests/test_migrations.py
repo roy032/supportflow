@@ -1,6 +1,9 @@
 """Migration tests: the migrations build exactly the schema the models describe, and
 databases created before migrations existed are upgraded in place."""
 
+import os
+import threading
+
 import pytest
 
 pytest.importorskip("alembic")
@@ -8,16 +11,10 @@ pytest.importorskip("alembic")
 from alembic import command  # noqa: E402
 from alembic.autogenerate import compare_metadata  # noqa: E402
 from alembic.migration import MigrationContext  # noqa: E402
-from sqlalchemy import create_engine, inspect, text  # noqa: E402
-from sqlalchemy.pool import StaticPool  # noqa: E402
+from sqlalchemy import inspect, text  # noqa: E402
 
 from app.db import Base, _alembic_config, init_db  # noqa: E402
-
-
-def memory_engine():
-    return create_engine(
-        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
-    )
+from tests.conftest import make_test_engine as memory_engine  # noqa: E402
 
 
 def test_migrations_match_the_models():
@@ -30,23 +27,16 @@ def test_migrations_match_the_models():
 
 def test_pre_migration_database_is_stamped_and_upgraded():
     engine = memory_engine()
-    # The schema as `create_all` made it before the job-queue columns existed.
+    # The baseline schema without a version table: what `create_all` made before
+    # migrations existed.
     with engine.begin() as connection:
-        connection.execute(text(
-            "CREATE TABLE events (id INTEGER PRIMARY KEY, external_id VARCHAR(128) NOT NULL,"
-            " source VARCHAR(32) NOT NULL, status VARCHAR(32) NOT NULL, payload JSON NOT NULL,"
-            " customer_name VARCHAR(200), customer_email VARCHAR(320), message TEXT NOT NULL,"
-            " created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
-        ))
+        command.upgrade(_alembic_config(connection), "0001")
+        connection.execute(text("DROP TABLE alembic_version"))
         connection.execute(text(
             "INSERT INTO events (external_id, source, status, payload, message, created_at,"
             " updated_at) VALUES ('old', 'tally', 'failed', '{}', 'hi', '2026-01-01',"
             " '2026-01-01')"
         ))
-        connection.execute(text(
-            "CREATE TABLE classifications (id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL)"
-        ))
-        connection.execute(text("CREATE TABLE failures (id INTEGER PRIMARY KEY)"))
 
     init_db(engine)
 
@@ -74,3 +64,27 @@ def test_every_migration_downgrades_cleanly():
     assert set(inspect(engine).get_table_names()) == {"alembic_version"}
     init_db(engine)
     assert {"events", "classifications", "failures"} <= set(inspect(engine).get_table_names())
+
+
+@pytest.mark.skipif(
+    not os.environ.get("TEST_DATABASE_URL", "").startswith("postgresql"),
+    reason="concurrent startup migrations are only guarded on Postgres",
+)
+def test_concurrent_startups_migrate_once():
+    from app.db import make_engine
+
+    memory_engine().dispose()  # wipe the schema
+    errors = []
+
+    def start():
+        try:
+            init_db(make_engine(os.environ["TEST_DATABASE_URL"]))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=start) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []

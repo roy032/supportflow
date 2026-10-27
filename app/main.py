@@ -247,6 +247,9 @@ def create_app(
                             "order_id": e.classification.order_id,
                             "summary": e.classification.summary,
                             "latency_ms": e.classification.latency_ms,
+                            "model": e.classification.model,
+                            "input_tokens": e.classification.input_tokens,
+                            "output_tokens": e.classification.output_tokens,
                         }
                         if e.classification
                         else None

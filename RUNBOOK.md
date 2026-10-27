@@ -69,6 +69,10 @@ The LLM step failed twice. The error in `/failures` says why:
 | `timed out` | The model is too slow on this machine | Raise `LLM_TIMEOUT_SECONDS`, close other heavy apps, or use a smaller model |
 | `not valid JSON` / `field '...'` | The model answered in the wrong format twice | Try the message with `python scripts/try_classifier.py "..."`; consider a larger model |
 | `Unexpected response shape` | Ollama answered, but not in the chat API format | Check `OLLAMA_URL` points at Ollama itself, not a proxy or another service |
+| `rejected the key` | `ANTHROPIC_API_KEY` is missing or wrong | Create a key at https://console.anthropic.com and set it in `.env` |
+| `Anthropic API rate limit` / `HTTP 5xx` / `Could not reach the Anthropic API` | Claude is busy or unreachable | Usually temporary; the job queue retries with backoff. Check https://status.anthropic.com |
+| `declined to classify` | A safety classifier refused the message even after the server-side fallback | Look at the message; it is likely abusive or spam. Mark it by hand |
+| `ran out of output tokens` | The answer was cut off | Rare for classification; lower `ANTHROPIC_EFFORT` |
 
 These are retried automatically. If the event ended up `dead`, run `python scripts/replay_events.py --status dead` after fixing the cause.
 

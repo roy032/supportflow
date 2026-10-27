@@ -75,6 +75,9 @@ class Classification(Base):
     summary: Mapped[str] = mapped_column(Text)
     model: Mapped[str] = mapped_column(String(64))
     latency_ms: Mapped[int] = mapped_column(Integer)
+    # Tokens used across all attempts, when the provider reports them.
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 

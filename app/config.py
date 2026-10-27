@@ -27,10 +27,17 @@ class Settings(BaseSettings):
     # customer data. Empty means those endpoints reject every request.
     admin_api_key: str = ""
 
-    llm_provider: str = "ollama"
+    llm_provider: Literal["ollama", "anthropic"] = "ollama"
+    # Used when LLM_PROVIDER fails to answer (down, timed out, rate limited). Empty: none.
+    llm_fallback_provider: Literal["", "ollama", "anthropic"] = ""
     ollama_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5:3b"
     llm_timeout_seconds: float = Field(default=120.0, gt=0)
+
+    # Claude. Without ANTHROPIC_API_KEY the SDK falls back to its own credential lookup.
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-opus-5-5"
+    anthropic_effort: Literal["low", "medium", "high", "xhigh", "max"] = "low"
 
     slack_webhook_url: str = ""
 
@@ -50,7 +57,10 @@ class Settings(BaseSettings):
     # "text" for people reading a terminal, "json" for a log pipeline.
     log_format: Literal["text", "json"] = "text"
 
-    @field_validator("tally_signing_secret", "admin_api_key", "slack_webhook_url", mode="before")
+    @field_validator(
+        "tally_signing_secret", "admin_api_key", "slack_webhook_url", "anthropic_api_key",
+        mode="before",
+    )
     @classmethod
     def _strip(cls, value: object) -> object:
         return value.strip() if isinstance(value, str) else value
@@ -72,13 +82,16 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _lease_outlasts_a_run(self) -> "Settings":
-        # A run is two LLM calls plus Slack retries. If the lease ran out first, a second
+        # A run is two classification attempts (each possibly trying a fallback model,
+        # whose SDK may retry) plus Slack retries. If the lease ran out first, a second
         # worker could take the event over and post it to Slack twice.
-        minimum = 2 * self.llm_timeout_seconds + 120
+        calls_per_attempt = 2 if self.llm_fallback_provider else 1
+        minimum = 2 * calls_per_attempt * self.llm_timeout_seconds + 120
         if self.job_lease_seconds < minimum:
             raise ValueError(
-                f"JOB_LEASE_SECONDS must be at least {minimum:.0f} "
-                "(2 x LLM_TIMEOUT_SECONDS + 120) so a slow run isn't picked up twice"
+                f"JOB_LEASE_SECONDS must be at least {minimum:.0f} (2 x LLM_TIMEOUT_SECONDS"
+                f"{' x 2 with a fallback provider' if self.llm_fallback_provider else ''}"
+                " + 120) so a slow run isn't picked up twice"
             )
         return self
 

@@ -31,7 +31,7 @@ flowchart LR
 
 ## Tech stack
 
-Python, FastAPI, SQLAlchemy 2.0 with Alembic migrations (SQLite locally, Postgres-ready), Pydantic, httpx, Ollama (local LLM, `qwen2.5:3b` by default), Slack incoming webhooks, pytest, GitHub Actions.
+Python, FastAPI, SQLAlchemy 2.0 with Alembic migrations (SQLite locally, Postgres-ready), Pydantic, httpx, Ollama (local LLM, `qwen2.5:3b` by default) or Claude through the Anthropic SDK, Prometheus metrics, Slack incoming webhooks, pytest, GitHub Actions.
 
 ## Design decisions
 
@@ -44,7 +44,8 @@ Python, FastAPI, SQLAlchemy 2.0 with Alembic migrations (SQLite locally, Postgre
 - **Observable by default.** Every response carries an `X-Request-ID` (taken from the caller when it is safe, otherwise generated), and every log line written while handling a request or running an event carries its `request_id` / `event_id`. `LOG_FORMAT=json` makes the logs one JSON object per line. `/metrics` serves Prometheus metrics. Queue depth, queue lag, events by status, failures in the last hour and LLM latency are read from the database at scrape time, so the numbers are right however many web servers and workers run.
 - **Schema changes are migrations.** Alembic migrations run on startup, and a database created before migrations existed is detected and upgraded in place.
 - **Structured, validated LLM output.** The model is constrained to a JSON schema, and the result is validated again with Pydantic. Invalid output gets one retry that tells the model what was wrong; if it still fails, the failure is recorded instead of crashing the worker.
-- **Provider interface.** The pipeline talks to an `LLMProvider` interface. Ollama keeps the project free and offline; a cloud model is a new class and one setting, with no pipeline changes.
+- **Provider interface.** The pipeline talks to an `LLMProvider` interface. Ollama keeps the project free and offline; Claude (`LLM_PROVIDER=anthropic`) is one setting away. Claude's structured output is constrained to the same JSON schema, and its server-side fallback re-runs a request that a safety classifier declined. `LLM_FALLBACK_PROVIDER` puts a second provider behind the first, for example Claude behind a local model that is down. Token counts are stored with every classification, so cost per message is known.
+- **Model choices are measured, not guessed.** `scripts/run_eval.py` scores any provider and model against a labelled set of English, Bangla and mixed messages (including spam and a prompt-injection attempt) and reports accuracy per field, latency, tokens and cost.
 - **Safe to re-run.** An event that is already classified is never sent to the LLM again; if only the Slack step failed, a retry resends the notification without paying for a second classification.
 - **Retry only what can succeed.** Slack calls retry network errors, `429` (honouring `Retry-After`, capped at 30 seconds) and `5xx` with exponential backoff. Other `4xx` errors and a malformed webhook URL fail immediately.
 - **Bounded waits.** Slack calls time out after 10 seconds. Ollama gets `LLM_TIMEOUT_SECONDS` to generate, but only 10 seconds to connect, so an unreachable host fails fast.
@@ -138,6 +139,16 @@ scrape_configs:
 
 Good first alerts: `supportflow_queue_lag_seconds > 600` (workers are down or falling behind), `increase(supportflow_events{status="dead"}[1h]) > 0`, and a rising `supportflow_failures_last_hour`.
 
+### Compare models
+
+```bash
+python scripts/run_eval.py --provider ollama --model qwen2.5:3b
+python scripts/run_eval.py --provider anthropic --model claude-opus-5-5 --json-out opus.json
+python scripts/run_eval.py --min-category-accuracy 0.9    # exits 1 below 90%, for CI or release checks
+```
+
+The labelled messages live in `evals/classification.jsonl`. Add a line whenever the model gets a real message wrong, so the set grows with what the shop actually receives. Cloud runs send every message to the provider and cost a few cents for the bundled set.
+
 ### Database migrations
 
 Migrations run automatically when the server or worker starts. After changing `app/models.py`, generate a migration and review it before committing:
@@ -190,7 +201,8 @@ app/
   security.py     Tally signature verification
   tally.py        Tally payload -> SupportMessage
   classifier.py   Prompt, JSON schema, validation and retry logic
-  llm/            LLMProvider interface and the Ollama provider
+  llm/            LLMProvider interface, fallback wrapper, Ollama and Claude providers
+  evaluation.py   Scores a provider against evals/classification.jsonl
   pipeline.py     Classify -> store -> notify, with failure recording
   jobs.py         Job queue on the events table: leases, retries with backoff, dead-lettering
   worker.py       Standalone worker process: python -m app.worker
@@ -215,5 +227,4 @@ DEVELOPMENT.md    Conventions and commands for working on the code
 - RAG auto-replies for common questions, answered from the shop's policy documents
 - Slack approve/edit buttons before a reply is sent
 - Daily summary report with n8n
-- Evaluation set of labelled messages, comparing local and cloud models on accuracy, latency and cost
 

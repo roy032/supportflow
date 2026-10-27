@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from app.classifier import SCHEMA, ClassificationError, classify
-from app.llm.base import LLMError
+from app.llm.base import LLMError, LLMResult
 from app.llm.ollama import OllamaProvider
 from app.tally import SupportMessage
 
@@ -34,7 +34,9 @@ class FakeProvider:
         item = self.responses.pop(0)
         if isinstance(item, Exception):
             raise item
-        return item if isinstance(item, str) else json.dumps(item)
+        if isinstance(item, LLMResult):
+            return item
+        return LLMResult(item if isinstance(item, str) else json.dumps(item))
 
 
 MSG = SupportMessage(message="Where is my order ORD-1042?", order_id="ORD-1042")
@@ -107,13 +109,18 @@ def test_ollama_provider_sends_schema_and_parses_reply():
     def handler(request: httpx.Request) -> httpx.Response:
         seen["url"] = str(request.url)
         seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"message": {"role": "assistant", "content": json.dumps(VALID)}})
+        return httpx.Response(200, json={
+            "message": {"role": "assistant", "content": json.dumps(VALID)},
+            "prompt_eval_count": 410,
+            "eval_count": 52,
+        })
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     provider = OllamaProvider("http://ollama.test/", "qwen2.5:3b", client=client)
-    raw = provider.complete_json("sys", "user", SCHEMA)
+    result = provider.complete_json("sys", "user", SCHEMA)
 
-    assert json.loads(raw) == VALID
+    assert json.loads(result.text) == VALID
+    assert (result.input_tokens, result.output_tokens) == (410, 52)
     assert seen["url"] == "http://ollama.test/api/chat"
     assert seen["body"]["model"] == "qwen2.5:3b"
     assert seen["body"]["stream"] is False

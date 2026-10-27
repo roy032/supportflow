@@ -4,7 +4,7 @@ from typing import Any
 
 import httpx
 
-from app.llm.base import LLMError
+from app.llm.base import LLMError, LLMResult
 
 # Connecting should be quick even when generation is slow; an unreachable host
 # should fail in seconds, not after the full generation timeout.
@@ -26,7 +26,7 @@ class OllamaProvider:
             timeout=httpx.Timeout(timeout, connect=min(timeout, CONNECT_TIMEOUT_SECONDS))
         )
 
-    def complete_json(self, system: str, user: str, schema: dict[str, Any]) -> str:
+    def complete_json(self, system: str, user: str, schema: dict[str, Any]) -> LLMResult:
         body = {
             "model": self.model,
             "messages": [
@@ -41,7 +41,8 @@ class OllamaProvider:
         try:
             response = self._client.post(f"{self.base_url}/api/chat", json=body)
             response.raise_for_status()
-            content = response.json()["message"]["content"]
+            data = response.json()
+            content = data["message"]["content"]
         except httpx.TimeoutException as exc:
             raise LLMError(f"Ollama timed out: {exc}") from exc
         except httpx.HTTPStatusError as exc:
@@ -56,4 +57,8 @@ class OllamaProvider:
             raise LLMError(
                 f"Unexpected response shape from Ollama: content is {type(content).__name__}"
             )
-        return content
+        return LLMResult(
+            text=content,
+            input_tokens=data.get("prompt_eval_count"),
+            output_tokens=data.get("eval_count"),
+        )

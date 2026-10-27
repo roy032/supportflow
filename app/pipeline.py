@@ -53,6 +53,8 @@ def _classify(session: Session, event: Event, provider: LLMProvider) -> bool:
         model=outcome.model,
         latency_ms=outcome.latency_ms,
         attempts=outcome.attempts,
+        input_tokens=outcome.input_tokens,
+        output_tokens=outcome.output_tokens,
     )
     event.status = EventStatus.CLASSIFIED
     session.commit()

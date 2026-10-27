@@ -100,6 +100,13 @@ class ClassificationOutcome:
     attempts: int
     latency_ms: int
     model: str
+    # Summed over every attempt, including invalid ones: that is what was paid for.
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+def _add(total: int | None, value: int | None) -> int | None:
+    return value if total is None else total + (value or 0)
 
 
 def classify(
@@ -113,6 +120,8 @@ def classify(
     user_prompt = build_user_prompt(message)
     last_error = "no attempts made"
     started = time.perf_counter()
+    input_tokens: int | None = None
+    output_tokens: int | None = None
 
     for attempt in range(1, max_attempts + 1):
         prompt = user_prompt
@@ -122,8 +131,10 @@ def classify(
                 "Reply with a single JSON object that follows the rules exactly."
             )
         try:
-            raw = provider.complete_json(SYSTEM_PROMPT, prompt, SCHEMA)
-            result = ClassificationResult.model_validate(json.loads(raw))
+            response = provider.complete_json(SYSTEM_PROMPT, prompt, SCHEMA)
+            input_tokens = _add(input_tokens, response.input_tokens)
+            output_tokens = _add(output_tokens, response.output_tokens)
+            result = ClassificationResult.model_validate(json.loads(response.text))
         except LLMError as exc:
             last_error = f"provider error: {exc}"
             continue
@@ -148,7 +159,9 @@ def classify(
             result=result,
             attempts=attempt,
             latency_ms=int((time.perf_counter() - started) * 1000),
-            model=provider.name,
+            model=response.model or provider.name,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )
 
     raise ClassificationError(

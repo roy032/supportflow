@@ -226,6 +226,7 @@ def test_dashboard_is_off_without_a_password(settings, session_factory):
 def test_tampered_cookie_is_rejected(client):
     login(client)
     value = client.cookies.get("sf_session")
+    client.cookies.clear()  # set() may add a second cookie instead of replacing the first
     client.cookies.set("sf_session", value[:-1] + ("0" if value[-1] != "0" else "1"),
                        path="/dashboard")
     assert client.get("/dashboard/tickets", follow_redirects=False).status_code == 303
